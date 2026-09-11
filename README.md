@@ -167,3 +167,20 @@ Social-media extractors such as Instagram do not always provide a normal
 
 This keeps the requested quality as a preference rather than turning it into a
 hard failure.
+
+
+## v1.3 — progress, quality and Telegram delivery
+
+- Media downloads now write real yt-dlp progress into MongoDB.
+- Render #1 edits one Telegram status message with a visual loading bar.
+- Media jobs show one extractor worker plus concurrent fragment count.
+- `R2_FALLBACK_LINKS=false` is the default: R2 is staging/storage; the finished file is expected to be archived in Telegram and delivered with `copyMessage`.
+- `/health` reports `telegram_archive_ready` and a safe `telegram_missing` list.
+
+
+## v1.4 URL-first auto detection
+
+The bot sends the URL to `/api/probe` first. Direct files start immediately in
+original quality. Media webpages return `kind=media`, so quality choices appear
+only for media. Classification is based on the actual HTTP response, not `.com`
+or a filename extension alone.

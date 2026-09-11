@@ -80,6 +80,7 @@ MTPROTO_R2_BUFFER_BYTES = max(
 R2_LINK_TTL_SECONDS = max(300, min(604800, int(os.getenv("R2_LINK_TTL_SECONDS", "86400"))))
 ARCHIVE_LARGE_LINKS = os.getenv("ARCHIVE_LARGE_LINKS", "true").strip().lower() not in {"0", "false", "no", "off"}
 DELETE_R2_AFTER_TELEGRAM_ARCHIVE = os.getenv("DELETE_R2_AFTER_TELEGRAM_ARCHIVE", "false").strip().lower() in {"1", "true", "yes", "on"}
+R2_FALLBACK_LINKS = os.getenv("R2_FALLBACK_LINKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", "1900000000"))
 MAX_REDIRECTS = max(1, min(10, int(os.getenv("MAX_REDIRECTS", "5"))))
@@ -94,7 +95,7 @@ YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
 TERABOX_HINTS = ("terabox", "1024tera", "nephobox", "4funbox", "mirrobox")
 
-app = FastAPI(title="Fattle Downloader", version="1.2-media-format-fallback")
+app = FastAPI(title="Fattle Downloader", version="1.4-url-first-auto-detect")
 
 mongo = None
 jobs = None
@@ -166,6 +167,94 @@ def telegram_api(method, *, data=None, files=None, timeout=(15, 180)):
     if r.status_code >= 400 or not payload.get("ok"):
         raise RuntimeError(f"Telegram {method} failed: {payload.get('description') or r.text[:300]}")
     return payload.get("result")
+
+
+_status_push_state = {}
+_status_push_lock = threading.Lock()
+
+
+def _progress_bar(percent, width=12):
+    percent = max(0, min(100, int(percent or 0)))
+    filled = int(round(width * percent / 100))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _status_message_text(doc):
+    status = str(doc.get("status") or "queued").replace("_", " ").upper()
+    progress = int(doc.get("progress") or 0)
+    filename = str(doc.get("filename") or "Preparing…")
+    size = int(doc.get("size") or 0)
+    quality = str(doc.get("requested_quality") or "best")
+    workers = int(doc.get("worker_count") or 0)
+    fragments = int(doc.get("fragment_workers") or 0)
+    if size >= 1024**3:
+        size_text = f"{size / (1024**3):.2f} GB"
+    elif size:
+        size_text = f"{size / (1024**2):.1f} MB"
+    else:
+        size_text = "—"
+    worker_text = str(workers or "—")
+    if fragments:
+        worker_text = f"{workers or 1} media worker • {fragments} fragments"
+    lines = [
+        "📥 <b>Download Status</b>", "",
+        f"📄 <code>{html.escape(filename[:180])}</code>",
+        f"🎚 Quality: <b>{html.escape(quality)}</b>",
+        f"📊 Status: <b>{html.escape(status)}</b>",
+        f"⏳ <code>{_progress_bar(progress)}</code> <b>{progress}%</b>",
+        f"📦 Size: <b>{size_text}</b>",
+        f"⚡ Workers: <b>{html.escape(worker_text)}</b>",
+    ]
+    tg = doc.get("telegram_upload_progress")
+    if str(doc.get("status") or "") == "uploading_telegram" and tg is not None:
+        tg = max(0, min(100, int(tg)))
+        lines += ["", "☁️ <b>Uploading to Telegram</b>", f"<code>{_progress_bar(tg)}</code> <b>{tg}%</b>"]
+    delivery = str(doc.get("delivery_mode") or "")
+    if delivery in {"telegram_archive_copy", "telegram_mtproto_archive_copy"}:
+        lines += ["", "✅ <b>File sent in Telegram</b>"]
+    elif str(doc.get("delivery_status") or "") == "failed":
+        err = str(doc.get("delivery_error") or doc.get("telegram_mtproto_error") or "")
+        lines += ["", "❌ <b>Telegram delivery failed</b>"]
+        if err:
+            lines.append(f"<code>{html.escape(err[:350])}</code>")
+    if doc.get("error"):
+        lines += ["", f"❌ <code>{html.escape(str(doc.get('error'))[:350])}</code>"]
+    return "\
+".join(lines)
+
+
+def maybe_push_status(job_id, force=False):
+    if jobs is None or not BOT_TOKEN:
+        return
+    try:
+        doc = jobs.find_one({"job_id": job_id}, {"_id": 0})
+    except Exception:
+        return
+    if not doc:
+        return
+    chat_id = doc.get("chat_id")
+    message_id = doc.get("status_message_id")
+    if not chat_id or not message_id:
+        return
+    progress = int(doc.get("progress") or 0)
+    tg = int(doc.get("telegram_upload_progress") or -1)
+    status = str(doc.get("status") or "")
+    signature = (status, progress // 4, tg // 4, str(doc.get("delivery_status") or ""))
+    with _status_push_lock:
+        if not force and _status_push_state.get(job_id) == signature:
+            return
+        _status_push_state[job_id] = signature
+    body = _status_message_text(doc)
+    def _edit():
+        try:
+            telegram_api("editMessageText", data={
+                "chat_id": str(int(chat_id)), "message_id": str(int(message_id)),
+                "text": body, "parse_mode": "HTML", "disable_web_page_preview": "true",
+            }, timeout=(10, 30))
+        except Exception as exc:
+            if "message is not modified" not in str(exc).lower():
+                log.warning("Could not update Telegram download status: %s", exc)
+    threading.Thread(target=_edit, daemon=True).start()
 
 
 def telegram_post_form(method, encoder, *, timeout=(15, 300)):
@@ -280,8 +369,21 @@ class R2BufferedReader(io.RawIOBase):
         return bytes(out)
 
 
+def telegram_archive_missing():
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not ARCHIVE_CHAT_ID:
+        missing.append("ARCHIVE_CHAT_ID")
+    if TELEGRAM_API_ID <= 0:
+        missing.append("TELEGRAM_API_ID")
+    if not TELEGRAM_API_HASH:
+        missing.append("TELEGRAM_API_HASH")
+    return missing
+
+
 def mtproto_configured():
-    return bool(BOT_TOKEN and ARCHIVE_CHAT_ID and TELEGRAM_API_ID > 0 and TELEGRAM_API_HASH)
+    return not telegram_archive_missing()
 
 
 async def _resolve_archive_entity(client):
@@ -506,14 +608,13 @@ def deliver_large_link(job_id, chat_id, key, filename, content_type, size):
 
 
 def deliver_completed_file(job_id, chat_id, key, filename, content_type, size):
-    """Archive once in Telegram, then server-side copyMessage to the user.
+    """Archive once in Telegram, then copyMessage to the user.
 
-    Small files use the normal Bot API. Larger files use MTProto streamed from
-    R2. If Telegram delivery fails, an expiring R2 link is sent as a fallback.
+    R2 is staging/storage. User-facing R2 links are used only when
+    R2_FALLBACK_LINKS=true.
     """
     if not BOT_TOKEN:
-        set_job(job_id, delivery_mode="r2_only", delivery_status="not_configured")
-        return {"delivery_mode": "r2_only"}
+        raise RuntimeError("BOT_TOKEN is not configured on Render #1")
 
     size = int(size)
 
@@ -525,26 +626,46 @@ def deliver_completed_file(job_id, chat_id, key, filename, content_type, size):
         except Exception as exc:
             log.exception("Small Telegram archive upload failed")
             set_job(job_id, telegram_archive_error=str(exc)[:1000])
+            if not R2_FALLBACK_LINKS:
+                raise RuntimeError(f"Telegram archive upload failed: {exc}") from exc
 
-    if size <= TELEGRAM_MTPROTO_MAX_BYTES and ARCHIVE_CHAT_ID and mtproto_configured():
-        try:
-            set_job(job_id, status="uploading_telegram", telegram_upload_progress=0)
-            result = archive_large_mtproto(job_id, chat_id, key, filename, content_type, size)
-            set_job(job_id, delivery_status="sent", **result)
-            return result
-        except Exception as exc:
-            log.exception("MTProto archive upload failed; falling back to R2 link")
-            set_job(job_id, telegram_mtproto_error=str(exc)[:1000])
+    if size <= TELEGRAM_MTPROTO_MAX_BYTES:
+        missing = telegram_archive_missing()
+        if missing:
+            message = "Telegram large-file archive is not configured. Missing: " + ", ".join(missing)
+            set_job(job_id, delivery_status="failed", telegram_mtproto_error=message)
+            if not R2_FALLBACK_LINKS:
+                raise RuntimeError(message)
+        else:
+            try:
+                set_job(job_id, status="uploading_telegram", progress=94, telegram_upload_progress=0)
+                result = archive_large_mtproto(job_id, chat_id, key, filename, content_type, size)
+                set_job(job_id, delivery_status="sent", **result)
+                return result
+            except Exception as exc:
+                log.exception("MTProto archive upload failed")
+                set_job(job_id, delivery_status="failed", telegram_mtproto_error=str(exc)[:1000])
+                if not R2_FALLBACK_LINKS:
+                    raise RuntimeError(f"Telegram large-file upload failed: {exc}") from exc
 
-    result = deliver_large_link(job_id, chat_id, key, filename, content_type, size)
-    set_job(job_id, delivery_status="sent", **result)
-    return result
+    if R2_FALLBACK_LINKS:
+        result = deliver_large_link(job_id, chat_id, key, filename, content_type, size)
+        set_job(job_id, delivery_status="sent", **result)
+        return result
+
+    raise RuntimeError("Telegram delivery could not be completed and R2_FALLBACK_LINKS is disabled.")
 
 
 def set_job(job_id, **fields):
     fields["updated_at"] = now()
     if jobs is not None:
         jobs.update_one({"job_id": job_id}, {"$set": fields}, upsert=True)
+        if any(k in fields for k in {
+            "status", "progress", "filename", "size", "worker_count",
+            "fragment_workers", "telegram_upload_progress",
+            "delivery_status", "delivery_mode", "error",
+        }):
+            maybe_push_status(job_id)
 
 
 def get_job(job_id):
@@ -681,7 +802,8 @@ class JobCreate(BaseModel):
     user_id: int
     chat_id: int
     url: str = Field(min_length=8, max_length=4096)
-    quality: str = "720p"
+    quality: str = "best"
+    status_message_id: int | None = None
 
 
 class WorkerRange(BaseModel):
@@ -707,6 +829,10 @@ WorkerYoutube = WorkerMedia
 
 class CancelRequest(BaseModel):
     user_id: int
+
+
+class ProbeRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=4096)
 
 
 def worker_download_range(body: WorkerRange):
@@ -835,6 +961,37 @@ def worker_download_media(body: WorkerMedia):
         outtmpl = str(Path(td) / "%(title).120B-%(id)s.%(ext)s")
         ffmpeg = ffmpeg_location()
 
+        progress_state = {"percent": -1}
+
+        def media_progress(d):
+            try:
+                state = str(d.get("status") or "")
+                if state == "downloading":
+                    downloaded = int(d.get("downloaded_bytes") or 0)
+                    total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                    if total > 0:
+                        percent = min(84, 5 + int(79 * downloaded / total))
+                    else:
+                        percent = max(5, progress_state["percent"])
+                    fields = {
+                        "status": "downloading",
+                        "progress": percent,
+                        "fragment_workers": YTDLP_FRAGMENT_CONCURRENCY,
+                    }
+                    info = d.get("info_dict") or {}
+                    candidate_name = d.get("filename") or info.get("_filename")
+                    if candidate_name:
+                        fields["filename"] = Path(str(candidate_name)).name
+                    if total > 0:
+                        fields["size"] = total
+                    if percent >= progress_state["percent"] + 2:
+                        progress_state["percent"] = percent
+                        set_job(body.job_id, **fields)
+                elif state == "finished":
+                    set_job(body.job_id, status="processing", progress=86, fragment_workers=YTDLP_FRAGMENT_CONCURRENCY)
+            except Exception:
+                pass
+
         opts = {
             "format": ytdlp_format(body.quality),
             "outtmpl": outtmpl,
@@ -849,6 +1006,7 @@ def worker_download_media(body: WorkerMedia):
             "continuedl": True,
             "concurrent_fragment_downloads": YTDLP_FRAGMENT_CONCURRENCY,
             "overwrites": True,
+            "progress_hooks": [media_progress],
         }
 
         if ffmpeg:
@@ -943,17 +1101,24 @@ def call_worker(url, path, payload):
 
 def maybe_deliver(job_id, chat_id, key, filename, content_type, size):
     try:
-        return deliver_completed_file(job_id, chat_id, key, filename, content_type, size)
+        deliver_completed_file(job_id, chat_id, key, filename, content_type, size)
+        return True
     except Exception as exc:
-        # The download itself is still valid in R2 even if Telegram notification fails.
         log.exception("Delivery failed for job %s", job_id)
-        set_job(job_id, delivery_status="failed", delivery_error=str(exc)[:1000])
-        return None
+        set_job(
+            job_id, status="delivery_failed", progress=95, delivery_status="failed",
+            delivery_error=str(exc)[:1000], error=str(exc)[:1000],
+        )
+        return False
 
 
 def run_direct_job(job_id, request: JobCreate):
     probe = probe_direct(request.url)
-    set_job(job_id, status="preparing", source_type="direct", filename=probe["filename"], size=probe["size"], content_type=probe["content_type"], progress=2)
+    set_job(
+        job_id, status="preparing", source_type="direct", filename=probe["filename"],
+        size=probe["size"], content_type=probe["content_type"], progress=2,
+        requested_quality="original",
+    )
     client = s3()
     key = f"jobs/{job_id}/{probe['filename']}"
     count = choose_part_count(probe["size"], probe["range"])
@@ -1001,19 +1166,25 @@ def run_direct_job(job_id, request: JobCreate):
         raise
 
     set_job(job_id, status="stored", progress=92, storage_key=key)
-    maybe_deliver(job_id, request.chat_id, key, probe["filename"], probe["content_type"], probe["size"])
-    set_job(job_id, status="complete", progress=100, completed_at=now())
+    if maybe_deliver(job_id, request.chat_id, key, probe["filename"], probe["content_type"], probe["size"]):
+        set_job(job_id, status="complete", progress=100, completed_at=now())
+        maybe_push_status(job_id, force=True)
 
 
 def run_media_job(job_id, request: JobCreate):
     if not WORKER_URLS:
         raise RuntimeError("At least one worker URL is required for media extraction")
-    set_job(job_id, status="downloading", source_type="media", progress=5, worker_count=1)
+    media_quality = "best" if str(request.quality or "").lower() == "original" else request.quality
+    set_job(
+        job_id, status="downloading", source_type="media", progress=5,
+        worker_count=1, fragment_workers=YTDLP_FRAGMENT_CONCURRENCY,
+        requested_quality=media_quality,
+    )
     result = call_worker(WORKER_URLS[0], "/worker/media", {
         "job_id": job_id,
         "source_url": request.url,
         "storage_key_prefix": f"jobs/{job_id}",
-        "quality": request.quality,
+        "quality": media_quality,
     })
     set_job(
         job_id,
@@ -1024,15 +1195,12 @@ def run_media_job(job_id, request: JobCreate):
         size=result["size"],
         content_type=result["content_type"],
     )
-    maybe_deliver(
-        job_id,
-        request.chat_id,
-        result["storage_key"],
-        result["filename"],
-        result["content_type"],
-        result["size"],
-    )
-    set_job(job_id, status="complete", progress=100, completed_at=now())
+    if maybe_deliver(
+        job_id, request.chat_id, result["storage_key"], result["filename"],
+        result["content_type"], result["size"],
+    ):
+        set_job(job_id, status="complete", progress=100, completed_at=now())
+        maybe_push_status(job_id, force=True)
 
 
 # Backward-compatible function name.
@@ -1075,14 +1243,23 @@ def run_job(job_id, request: JobCreate):
 
 
 @app.get("/")
+@app.head("/")
 def root():
-    return {"service": "fattle-downloader", "role": ROLE, "coordinator": COORDINATOR_ENABLED, "mtproto": mtproto_configured()}
+    return {
+        "service": "fattle-downloader", "role": ROLE, "coordinator": COORDINATOR_ENABLED,
+        "mtproto": mtproto_configured(), "telegram_archive_ready": mtproto_configured(),
+        "telegram_missing": telegram_archive_missing(), "r2_fallback_links": R2_FALLBACK_LINKS,
+    }
 
 
 @app.get("/health")
 @app.head("/health")
 def health():
-    return {"ok": True, "role": ROLE, "coordinator": COORDINATOR_ENABLED}
+    return {
+        "ok": True, "role": ROLE, "coordinator": COORDINATOR_ENABLED,
+        "telegram_archive_ready": mtproto_configured(),
+        "telegram_missing": telegram_archive_missing(),
+    }
 
 
 @app.post("/worker/range")
@@ -1110,6 +1287,50 @@ def worker_youtube(body: WorkerYoutube, x_worker_secret: str | None = Header(def
         raise HTTPException(status_code=422, detail=str(exc)[:700])
 
 
+@app.post("/api/probe")
+def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(default=None)):
+    """Classify a URL before asking the Telegram user for quality."""
+    auth_client(x_downloader_secret)
+    if not COORDINATOR_ENABLED:
+        raise HTTPException(status_code=404, detail="Coordinator API is disabled on this service")
+    try:
+        validate_public_url(body.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    kind = source_kind(body.url)
+    if kind == "youtube":
+        return {"ok": True, "kind": "media", "source_type": "youtube"}
+
+    try:
+        info = probe_direct(body.url)
+        return {
+            "ok": True,
+            "kind": "direct",
+            "source_type": "direct",
+            "filename": info.get("filename"),
+            "size": info.get("size"),
+            "content_type": info.get("content_type"),
+            "range": bool(info.get("range")),
+            "worker_count": choose_part_count(
+                int(info.get("size") or 0), bool(info.get("range"))
+            ),
+        }
+    except ValueError as exc:
+        message = str(exc)
+        low = message.lower()
+        if kind == "terabox" and "terabox" in low:
+            raise HTTPException(status_code=400, detail=message)
+        if (
+            message.startswith("MEDIA_PAGE:")
+            or "reliable file size" in low
+            or "http 405" in low
+            or "http 403" in low
+        ):
+            return {"ok": True, "kind": "media", "source_type": "media"}
+        raise HTTPException(status_code=400, detail=message)
+
+
 @app.post("/api/jobs")
 def create_job(body: JobCreate, x_downloader_secret: str | None = Header(default=None)):
     auth_client(x_downloader_secret)
@@ -1127,14 +1348,17 @@ def create_job(body: JobCreate, x_downloader_secret: str | None = Header(default
         "user_id": int(body.user_id),
         "chat_id": int(body.chat_id),
         "source_url": body.url,
+        "requested_quality": body.quality,
+        "status_message_id": int(body.status_message_id) if body.status_message_id else None,
         "status": "queued",
         "progress": 0,
         "created_at": now(),
         "updated_at": now(),
         "cancel_requested": False,
     })
+    maybe_push_status(job_id, force=True)
     threading.Thread(target=run_job, args=(job_id, body), daemon=True).start()
-    return {"ok": True, "job_id": job_id, "status": "queued"}
+    return {"ok": True, "job_id": job_id, "status": "queued", "telegram_archive_ready": mtproto_configured()}
 
 
 @app.get("/api/jobs/{job_id}")
