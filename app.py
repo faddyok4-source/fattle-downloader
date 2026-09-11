@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import socket
+import shutil
 import tempfile
 import html
 import threading
@@ -27,9 +28,15 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient, DESCENDING
 from pymongo.server_api import ServerApi
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from telethon import TelegramClient, utils as telethon_utils
 from telethon.sessions import StringSession
+
+try:
+    import imageio_ffmpeg
+except Exception:
+    imageio_ffmpeg = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fattle-downloader")
@@ -79,11 +86,15 @@ MAX_REDIRECTS = max(1, min(10, int(os.getenv("MAX_REDIRECTS", "5"))))
 DOWNLOAD_TIMEOUT = max(30, min(3600, int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "900"))))
 MIN_MULTIPART_PART = 5 * 1024 * 1024
 MAX_WORKERS_PER_JOB = 4
+YTDLP_FRAGMENT_CONCURRENCY = max(
+    1, min(4, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "4")))
+)
+YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
 TERABOX_HINTS = ("terabox", "1024tera", "nephobox", "4funbox", "mirrobox")
 
-app = FastAPI(title="Fattle Downloader", version="1.0")
+app = FastAPI(title="Fattle Downloader", version="1.1-media")
 
 mongo = None
 jobs = None
@@ -636,8 +647,13 @@ def probe_direct(url):
             raise ValueError("The source did not provide a reliable file size")
         if total > MAX_FILE_BYTES:
             raise ValueError(f"File is too large ({total} bytes). Limit is {MAX_FILE_BYTES} bytes")
-        if content_type.startswith("text/html") and source_kind(url) == "terabox":
-            raise ValueError("This TeraBox share page is not a direct public file URL. This build does not bypass TeraBox login/share restrictions.")
+        if content_type.startswith("text/html"):
+            if source_kind(url) == "terabox":
+                raise ValueError(
+                    "This TeraBox share page is not a direct public file URL. "
+                    "This build does not bypass TeraBox login/share restrictions."
+                )
+            raise ValueError("MEDIA_PAGE: source is a webpage, not a direct file")
         return {"url": final_url, "size": total, "range": ranges, "filename": filename, "content_type": content_type}
     finally:
         r.close()
@@ -678,11 +694,15 @@ class WorkerRange(BaseModel):
     end: int
 
 
-class WorkerYoutube(BaseModel):
+class WorkerMedia(BaseModel):
     job_id: str
     source_url: str
     storage_key_prefix: str
     quality: str = "720p"
+
+
+# Backward-compatible name for older coordinator calls.
+WorkerYoutube = WorkerMedia
 
 
 class CancelRequest(BaseModel):
@@ -726,22 +746,81 @@ def worker_download_range(body: WorkerRange):
         response.close()
 
 
+def ffmpeg_location():
+    """Return a bundled FFmpeg path when imageio-ffmpeg provides one."""
+    if imageio_ffmpeg is None:
+        return None
+    try:
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        return path if path and Path(path).exists() else None
+    except Exception:
+        return None
+
+
 def ytdlp_format(quality):
-    q = (quality or "720p").lower()
-    if q == "audio":
-        return "bestaudio/best"
-    height = 720
-    m = re.search(r"(360|480|720|1080)", q)
-    if m:
-        height = int(m.group(1))
-    # Prefer a progressive MP4 to avoid requiring FFmpeg. Public videos only.
-    return f"best[ext=mp4][height<={height}]/best[height<={height}]/best"
+    q = (quality or "720p").strip().lower()
+
+    if q in {"audio", "audio only", "mp3", "m4a"}:
+        # Keep the source audio container; no lossy re-encode is required.
+        return "bestaudio[ext=m4a]/bestaudio/best"
+
+    if q in {"best", "max", "highest"}:
+        height = None
+    else:
+        height = 720
+        m = re.search(r"(144|240|360|480|720|1080)", q)
+        if m:
+            height = int(m.group(1))
+
+    ffmpeg = ffmpeg_location()
+    if ffmpeg:
+        if height:
+            return (
+                f"bv*[height<={height}]+ba/"
+                f"b[height<={height}]/"
+                f"best[height<={height}]"
+            )
+        return "bv*+ba/b/best"
+
+    # Without FFmpeg, prefer a single progressive stream so merging isn't needed.
+    if height:
+        return f"b[height<={height}]/best[height<={height}]/best"
+    return "b/best"
 
 
-def worker_download_youtube(body: WorkerYoutube):
+def friendly_ytdlp_error(message):
+    raw = str(message or "")
+    low = raw.lower()
+
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "This site is asking this cloud server to sign in or complete verification. "
+            "This downloader does not bypass site verification. Try a public direct-file URL "
+            "or another public source."
+        )
+    if "private video" in low or "private" in low and "video" in low:
+        return "This media is private and is not available to the public downloader."
+    if "members-only" in low or "premium" in low:
+        return "This media requires account or premium access and is not supported."
+    if "copyright" in low and "unavailable" in low:
+        return "This media is unavailable from the source."
+    if "unsupported url" in low:
+        return "This website or URL is not supported by the media extractor."
+    if "video unavailable" in low:
+        return "The media is unavailable from the source."
+
+    # Avoid sending a huge extractor traceback back to Telegram.
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    return cleaned[:600] or "The media extractor could not download this URL."
+
+
+def worker_download_media(body: WorkerMedia):
     validate_public_url(body.source_url)
-    with tempfile.TemporaryDirectory(prefix=f"yt-{body.job_id}-") as td:
+
+    with tempfile.TemporaryDirectory(prefix=f"media-{body.job_id}-") as td:
         outtmpl = str(Path(td) / "%(title).120B-%(id)s.%(ext)s")
+        ffmpeg = ffmpeg_location()
+
         opts = {
             "format": ytdlp_format(body.quality),
             "outtmpl": outtmpl,
@@ -750,23 +829,66 @@ def worker_download_youtube(body: WorkerYoutube):
             "no_warnings": True,
             "restrictfilenames": True,
             "socket_timeout": 30,
+            "retries": YTDLP_RETRIES,
+            "fragment_retries": YTDLP_RETRIES,
+            "extractor_retries": min(3, YTDLP_RETRIES),
+            "continuedl": True,
+            "concurrent_fragment_downloads": YTDLP_FRAGMENT_CONCURRENCY,
+            "overwrites": True,
         }
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(body.source_url, download=True)
-            path = Path(ydl.prepare_filename(info))
-        if not path.exists():
-            files = [p for p in Path(td).iterdir() if p.is_file()]
-            if not files:
-                raise RuntimeError("yt-dlp did not produce a file")
-            path = max(files, key=lambda p: p.stat().st_size)
+
+        if ffmpeg:
+            opts["ffmpeg_location"] = ffmpeg
+            opts["merge_output_format"] = "mp4"
+
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(body.source_url, download=True)
+                prepared = Path(ydl.prepare_filename(info))
+        except DownloadError as exc:
+            raise RuntimeError(friendly_ytdlp_error(exc)) from exc
+
+        # The final file can differ from prepare_filename after FFmpeg merging.
+        candidates = [
+            p for p in Path(td).iterdir()
+            if p.is_file()
+            and not p.name.endswith((".part", ".ytdl"))
+        ]
+        if prepared.exists():
+            path = prepared
+        elif candidates:
+            path = max(candidates, key=lambda p: p.stat().st_size)
+        else:
+            raise RuntimeError("The media extractor did not produce a downloadable file.")
+
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
-            raise RuntimeError(f"YouTube result is too large ({size} bytes)")
+            raise RuntimeError(
+                f"Media result is too large ({size} bytes). Limit is {MAX_FILE_BYTES} bytes."
+            )
+
         filename = re.sub(r"[^A-Za-z0-9._()\- ]+", "_", path.name)[:180]
         key = f"{body.storage_key_prefix}/{filename}"
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        s3().upload_file(str(path), STORAGE_BUCKET, key, ExtraArgs={"ContentType": content_type})
-        return {"storage_key": key, "filename": filename, "size": size, "content_type": content_type}
+
+        s3().upload_file(
+            str(path),
+            STORAGE_BUCKET,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+
+        return {
+            "storage_key": key,
+            "filename": filename,
+            "size": size,
+            "content_type": content_type,
+        }
+
+
+# Keep old function name for compatibility with older calls.
+def worker_download_youtube(body: WorkerYoutube):
+    return worker_download_media(body)
 
 
 def call_worker(url, path, payload):
@@ -777,7 +899,14 @@ def call_worker(url, path, payload):
         timeout=(15, DOWNLOAD_TIMEOUT),
     )
     if r.status_code >= 400:
-        raise RuntimeError(f"Worker {url} failed: HTTP {r.status_code}: {r.text[:300]}")
+        detail = r.text[:700]
+        try:
+            payload = r.json()
+            if isinstance(payload, dict) and payload.get("detail"):
+                detail = str(payload["detail"])[:700]
+        except Exception:
+            pass
+        raise RuntimeError(f"Worker {url} failed: {detail}")
     return r.json()
 
 
@@ -845,19 +974,39 @@ def run_direct_job(job_id, request: JobCreate):
     set_job(job_id, status="complete", progress=100, completed_at=now())
 
 
-def run_youtube_job(job_id, request: JobCreate):
+def run_media_job(job_id, request: JobCreate):
     if not WORKER_URLS:
-        raise RuntimeError("At least one worker URL is required for YouTube")
-    set_job(job_id, status="downloading", source_type="youtube", progress=5, worker_count=1)
-    result = call_worker(WORKER_URLS[0], "/worker/youtube", {
+        raise RuntimeError("At least one worker URL is required for media extraction")
+    set_job(job_id, status="downloading", source_type="media", progress=5, worker_count=1)
+    result = call_worker(WORKER_URLS[0], "/worker/media", {
         "job_id": job_id,
         "source_url": request.url,
         "storage_key_prefix": f"jobs/{job_id}",
         "quality": request.quality,
     })
-    set_job(job_id, status="stored", progress=92, storage_key=result["storage_key"], filename=result["filename"], size=result["size"], content_type=result["content_type"])
-    maybe_deliver(job_id, request.chat_id, result["storage_key"], result["filename"], result["content_type"], result["size"])
+    set_job(
+        job_id,
+        status="stored",
+        progress=92,
+        storage_key=result["storage_key"],
+        filename=result["filename"],
+        size=result["size"],
+        content_type=result["content_type"],
+    )
+    maybe_deliver(
+        job_id,
+        request.chat_id,
+        result["storage_key"],
+        result["filename"],
+        result["content_type"],
+        result["size"],
+    )
     set_job(job_id, status="complete", progress=100, completed_at=now())
+
+
+# Backward-compatible function name.
+def run_youtube_job(job_id, request: JobCreate):
+    return run_media_job(job_id, request)
 
 
 def run_job(job_id, request: JobCreate):
@@ -869,9 +1018,26 @@ def run_job(job_id, request: JobCreate):
                 return
         kind = source_kind(request.url)
         if kind == "youtube":
-            run_youtube_job(job_id, request)
-        else:
+            run_media_job(job_id, request)
+        elif kind == "terabox":
+            # Only public direct-file TeraBox URLs are accepted.
             run_direct_job(job_id, request)
+        else:
+            # Prefer the fast 4-worker direct-file path. If the URL is a normal
+            # webpage rather than a file, fall back to yt-dlp's extractor list.
+            try:
+                run_direct_job(job_id, request)
+            except ValueError as exc:
+                msg = str(exc)
+                if (
+                    msg.startswith("MEDIA_PAGE:")
+                    or "reliable file size" in msg.lower()
+                    or "source returned http 405" in msg.lower()
+                ):
+                    set_job(job_id, status="preparing", progress=3, source_type="media")
+                    run_media_job(job_id, request)
+                else:
+                    raise
     except Exception as exc:
         log.exception("Download job %s failed", job_id)
         set_job(job_id, status="failed", error=str(exc)[:1000])
@@ -894,10 +1060,23 @@ def worker_range(body: WorkerRange, x_worker_secret: str | None = Header(default
     return worker_download_range(body)
 
 
+@app.post("/worker/media")
+def worker_media(body: WorkerMedia, x_worker_secret: str | None = Header(default=None)):
+    auth_worker(x_worker_secret)
+    try:
+        return worker_download_media(body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:700])
+
+
 @app.post("/worker/youtube")
 def worker_youtube(body: WorkerYoutube, x_worker_secret: str | None = Header(default=None)):
+    # Compatibility endpoint for older coordinator builds.
     auth_worker(x_worker_secret)
-    return worker_download_youtube(body)
+    try:
+        return worker_download_youtube(body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:700])
 
 
 @app.post("/api/jobs")

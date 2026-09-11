@@ -126,3 +126,30 @@ is not re-uploaded for each user. The MTProto uploader uses buffered R2 range
 reads instead of writing the complete multi-GB object to Render's local disk.
 
 If MTProto upload fails, the user receives an expiring R2 link as fallback.
+
+
+## Media extractor upgrade
+
+This build uses an independent server-side implementation inspired by the
+feature model of YTDLnis: yt-dlp extraction, FFmpeg-assisted format merging,
+retry support, and concurrent fragment downloads.
+
+It does **not** copy the YTDLnis Android source and does not use the YTDLnis
+name for this application.
+
+Supported behavior:
+
+- Direct range-capable files: up to 4 Render workers.
+- Public media pages supported by yt-dlp: one extraction worker with up to 4
+  concurrent media fragments.
+- Bundled FFmpeg support through `imageio-ffmpeg` when available.
+- Quality values: `360p`, `480p`, `720p`, `1080p`, `best`, `audio`.
+- R2 -> MTProto private archive -> Telegram `copyMessage` delivery remains
+  unchanged.
+- TeraBox remains direct-public-file only.
+- No cookies, account sessions, paywall bypass, DRM bypass, or private-access
+  bypass are included.
+
+A site can still reject cloud-hosted IP addresses. In particular, if a site
+returns an account-verification or anti-bot challenge, the downloader returns a
+clear error instead of attempting to bypass it.
