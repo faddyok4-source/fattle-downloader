@@ -94,7 +94,7 @@ YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
 TERABOX_HINTS = ("terabox", "1024tera", "nephobox", "4funbox", "mirrobox")
 
-app = FastAPI(title="Fattle Downloader", version="1.1-media")
+app = FastAPI(title="Fattle Downloader", version="1.2-media-format-fallback")
 
 mongo = None
 jobs = None
@@ -758,10 +758,15 @@ def ffmpeg_location():
 
 
 def ytdlp_format(quality):
+    """Prefer the requested quality, but always keep a general fallback.
+
+    Some extractors (notably Instagram and other social sites) expose formats
+    without a normal height field. A strict `height<=720` selector can therefore
+    match nothing even though a perfectly downloadable format exists.
+    """
     q = (quality or "720p").strip().lower()
 
     if q in {"audio", "audio only", "mp3", "m4a"}:
-        # Keep the source audio container; no lossy re-encode is required.
         return "bestaudio[ext=m4a]/bestaudio/best"
 
     if q in {"best", "max", "highest"}:
@@ -773,19 +778,23 @@ def ytdlp_format(quality):
             height = int(m.group(1))
 
     ffmpeg = ffmpeg_location()
+
     if ffmpeg:
         if height:
+            # Requested height first, then any muxable/best format.
             return (
                 f"bv*[height<={height}]+ba/"
                 f"b[height<={height}]/"
-                f"best[height<={height}]"
+                f"bv*+ba/"
+                f"best"
             )
-        return "bv*+ba/b/best"
+        return "bv*+ba/best"
 
-    # Without FFmpeg, prefer a single progressive stream so merging isn't needed.
+    # Without FFmpeg, prefer a single progressive file. The final /best keeps
+    # social extractors usable even when they omit width/height metadata.
     if height:
-        return f"b[height<={height}]/best[height<={height}]/best"
-    return "b/best"
+        return f"b[height<={height}]/best"
+    return "best"
 
 
 def friendly_ytdlp_error(message):
@@ -804,6 +813,11 @@ def friendly_ytdlp_error(message):
         return "This media requires account or premium access and is not supported."
     if "copyright" in low and "unavailable" in low:
         return "This media is unavailable from the source."
+    if "requested format is not available" in low:
+        return (
+            "The source did not expose a downloadable format for this media. "
+            "Try Best quality or another public media URL."
+        )
     if "unsupported url" in low:
         return "This website or URL is not supported by the media extractor."
     if "video unavailable" in low:
@@ -846,7 +860,24 @@ def worker_download_media(body: WorkerMedia):
                 info = ydl.extract_info(body.source_url, download=True)
                 prepared = Path(ydl.prepare_filename(info))
         except DownloadError as exc:
-            raise RuntimeError(friendly_ytdlp_error(exc)) from exc
+            message = str(exc)
+            low = message.lower()
+
+            # Some sites expose only one unusual format or omit normal height
+            # metadata. If the requested format is unavailable, retry once with
+            # yt-dlp's broadest public format selection.
+            if "requested format is not available" in low:
+                retry_opts = dict(opts)
+                retry_opts["format"] = "best"
+                retry_opts.pop("merge_output_format", None)
+                try:
+                    with YoutubeDL(retry_opts) as ydl:
+                        info = ydl.extract_info(body.source_url, download=True)
+                        prepared = Path(ydl.prepare_filename(info))
+                except DownloadError as retry_exc:
+                    raise RuntimeError(friendly_ytdlp_error(retry_exc)) from retry_exc
+            else:
+                raise RuntimeError(friendly_ytdlp_error(exc)) from exc
 
         # The final file can differ from prepare_filename after FFmpeg merging.
         candidates = [

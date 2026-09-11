@@ -153,3 +153,17 @@ Supported behavior:
 A site can still reject cloud-hosted IP addresses. In particular, if a site
 returns an account-verification or anti-bot challenge, the downloader returns a
 clear error instead of attempting to bypass it.
+
+
+## v1.2 format fallback
+
+Social-media extractors such as Instagram do not always provide a normal
+`height` field for every downloadable format. The downloader now:
+
+1. Tries the requested quality.
+2. Falls back to a general video+audio/best selector.
+3. If yt-dlp still reports "Requested format is not available", retries once
+   with `best`.
+
+This keeps the requested quality as a preference rather than turning it into a
+hard failure.
