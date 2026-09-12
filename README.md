@@ -292,3 +292,178 @@ still enforced.
 
 Cobalt 4xx responses now preserve the provider's structured error code in the
 job error instead of only showing `Cobalt returned HTTP 400`.
+
+
+## Telegram inline video delivery
+
+MP4/M4V output is now archived as Telegram **video media**, not as a generic
+document. Because the bot uses `copyMessage`, the user receives the same media
+type and gets Telegram's inline video player/thumbnail.
+
+- Small MP4: Bot API `sendVideo` with `supports_streaming=true`.
+- Large MP4: MTProto upload with `force_document=false` and streaming enabled.
+- ZIP/PDF/other files: remain normal documents.
+- If Telegram rejects a particular small MP4 as video, the service safely
+  falls back to document delivery so the file is not lost.
+
+
+# v2.0 — Clean provider router
+
+Provider-specific API code is no longer mixed into `app.py`.
+
+```text
+providers/
+├── base.py       shared HTTP/retry/result contract
+├── router.py     platform detection + fallback order
+├── youtube.py    EasyDown + Tunelio
+├── cobalt.py     Cobalt for social media
+└── terabox.py    TeraBox Gateway
+```
+
+Routing:
+
+```text
+YouTube
+  -> EasyDown
+  -> Tunelio (if configured)
+  -> optional yt-dlp fallback
+
+Instagram / TikTok
+  -> Cobalt
+  -> EasyDown unified fallback (if configured)
+  -> optional yt-dlp fallback
+
+TeraBox
+  -> TeraBox Gateway
+
+Direct files
+  -> existing HTTP Range detection
+  -> up to 4 Fattle workers
+```
+
+Resolved provider URLs still enter the same secure Fattle pipeline:
+
+```text
+provider -> direct/tunnel URL -> 1–4 workers -> R2 -> Telegram archive -> copyMessage
+```
+
+Video delivery remains Telegram video media for MP4/M4V so supported videos get
+an inline player rather than a generic document icon.
+
+
+# v2.1 — Clean OmegaTech YouTube provider
+
+YouTube is now isolated behind one provider adapter:
+
+```text
+providers/
+├── base.py
+├── router.py
+├── omegatech.py   YouTube
+├── cobalt.py      Instagram / TikTok
+└── terabox.py     TeraBox
+```
+
+Routing:
+
+```text
+YouTube           -> OmegaTech
+Instagram/TikTok  -> Cobalt
+TeraBox           -> TeraBox Gateway
+Direct files      -> existing 1–4 Fattle workers
+```
+
+OmegaTech does not require an API key. Because its public searchable docs
+currently do not expose the exact YouTube endpoint path reliably, the build
+does not guess one. Set `OMEGATECH_YOUTUBE_ENDPOINT` to the current endpoint
+shown in OmegaTech's docs.
+
+The adapter intentionally supports configurable GET/POST method and parameter
+names and parses several common JSON download-response shapes. That lets the
+endpoint be updated without rewriting the Fattle downloader.
+
+Existing R2 streaming, Cobalt tunnel handling, 4-worker range downloads,
+Telegram archive/copyMessage, and inline MP4 video delivery remain unchanged.
+
+
+## v2.2 — Exact OmegaTech yt-dl request
+
+The OmegaTech YouTube adapter now matches the documented endpoint exactly:
+
+```text
+GET /api/download/yt-dl
+?url=<youtube-url>
+&format=mp4
+&quality=720p
+```
+
+Audio requests use:
+
+```text
+format=mp3
+quality=320K
+```
+
+Supported documented MP4 qualities are 360p, 480p, 720p and 1080p.
+The API documentation also exposes `action=formats` to list available formats.
+
+If OmegaTech itself returns HTTP 500 / `Response not JSON`, Fattle reports the
+provider error cleanly instead of falling through to a misleading local error.
+
+
+## v2.2.1 — provider 5xx detail preservation
+
+The shared provider HTTP client still retries transient 5xx responses, but the
+final HTTP response is now returned to the provider adapter. This preserves
+provider-specific error bodies.
+
+Example:
+
+```text
+Before:
+Provider returned HTTP 500
+
+After:
+Response not JSON
+```
+
+This is diagnostic handling only. If OmegaTech itself is returning HTTP 500,
+Fattle cannot repair OmegaTech's upstream downloader; it can only report the
+real provider error cleanly and allow another provider to be configured later.
+
+
+# v3.0 — AHM7 + Prexzy YouTube router
+
+YouTube no longer uses OmegaTech.
+
+```text
+YouTube
+  -> AHM7 AllDL (primary)
+  -> Prexzy ytmp4/ytmp3 (fallback)
+
+Instagram / TikTok
+  -> Cobalt
+
+TeraBox
+  -> TeraBox Gateway
+
+Direct file
+  -> existing Fattle 1–4 worker range downloader
+```
+
+AHM7 is first because it documents a single no-auth `/api/alldl` request that
+returns `videoUrl`, `audioUrl`, and `qualities[]`. Fattle uses the requested
+quality when AHM7 exposes it.
+
+Prexzy is a fallback. Its dedicated `ytmp4` endpoint documents the best direct
+video quality, so an exact requested resolution is not guaranteed when the
+fallback is used.
+
+Both YouTube providers require no API key in this build.
+
+Existing features remain:
+- direct range downloads with up to four workers;
+- unknown-size provider streams to R2;
+- private Telegram archive + copyMessage;
+- MP4/M4V delivered as Telegram video media with inline player;
+- MongoDB progress/status.

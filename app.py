@@ -33,6 +33,7 @@ from yt_dlp.utils import DownloadError
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from telethon import TelegramClient, utils as telethon_utils
 from telethon.sessions import StringSession
+from providers import ProviderError, ProviderRouter, detect_platform
 
 try:
     import imageio_ffmpeg
@@ -99,15 +100,14 @@ YTDLP_FRAGMENT_CONCURRENCY = max(
 )
 YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 
-# Optional resolver providers. These are coordinator-side only; workers never
-# need the provider secrets. Cobalt is intended for public/authorized media
-# URLs. TeraBox Gateway is used only for public share links.
-COBALT_API_URL = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
-COBALT_API_KEY = os.getenv("COBALT_API_KEY", "").strip()
-TERABOX_API_URL = os.getenv("TERABOX_API_URL", "").strip().rstrip("/")
+# Resolver-provider settings. Provider secrets are used only by the coordinator.
 PROVIDER_TIMEOUT_SECONDS = max(5, min(120, int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "30"))))
 PROVIDER_RETRIES = max(0, min(3, int(os.getenv("PROVIDER_RETRIES", "2"))))
-PROVIDER_FALLBACK_YTDLP = os.getenv("PROVIDER_FALLBACK_YTDLP", "true").strip().lower() in {"1", "true", "yes", "on"}
+PROVIDER_FALLBACK_YTDLP = os.getenv("PROVIDER_FALLBACK_YTDLP", "false").strip().lower() in {"1", "true", "yes", "on"}
+PROVIDER_ROUTER = ProviderRouter.from_env(
+    timeout_seconds=PROVIDER_TIMEOUT_SECONDS,
+    retries=PROVIDER_RETRIES,
+)
 
 # Deno is installed into the project by build.sh. yt-dlp uses it for
 # JavaScript challenge handling where supported (especially YouTube).
@@ -137,7 +137,7 @@ TERABOX_HINTS = (
     "terafileshare", "terasharefile", "terasharelink",
 )
 
-app = FastAPI(title="Fattle Downloader", version="1.8-cobalt-stream-fallback")
+app = FastAPI(title="Fattle Downloader", version="3.0-ahm7-prexzy")
 
 mongo = None
 jobs = None
@@ -431,6 +431,16 @@ def mtproto_configured():
     return not telegram_archive_missing()
 
 
+TELEGRAM_INLINE_VIDEO_EXTENSIONS = {".mp4", ".m4v"}
+
+
+def is_telegram_inline_video(filename, content_type=None):
+    """Return True for video files that Telegram can normally show inline."""
+    ext = Path(str(filename or "")).suffix.lower()
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    return ext in TELEGRAM_INLINE_VIDEO_EXTENSIONS or mime == "video/mp4"
+
+
 async def _resolve_archive_entity(client):
     wanted = int(ARCHIVE_CHAT_ID)
     async for dialog in client.iter_dialogs():
@@ -494,11 +504,14 @@ async def _archive_large_mtproto_async(job_id, key, filename, content_type, size
             part_size_kb=512,
             progress_callback=progress,
         )
+
+        inline_video = is_telegram_inline_video(filename, content_type)
         message = await client.send_file(
             archive_entity,
             uploaded,
             caption=caption,
-            force_document=True,
+            force_document=not inline_video,
+            supports_streaming=inline_video,
         )
         return int(message.id)
     finally:
@@ -544,6 +557,7 @@ def archive_large_mtproto(job_id, chat_id, key, filename, content_type, size):
 
     return {
         "delivery_mode": "telegram_mtproto_archive_copy",
+        "delivery_media_type": "video" if is_telegram_inline_video(filename, content_type) else "document",
         "archive_message_id": message_id,
         "user_message_id": int((copied or {}).get("message_id") or 0),
         "telegram_upload_progress": 100,
@@ -553,28 +567,59 @@ def archive_large_mtproto(job_id, chat_id, key, filename, content_type, size):
 def archive_small_file(job_id, chat_id, key, filename, content_type, size):
     if not ARCHIVE_CHAT_ID:
         raise RuntimeError("ARCHIVE_CHAT_ID is not configured")
+
     client = s3()
-    with tempfile.NamedTemporaryFile(prefix=f"archive-{job_id}-", suffix="-" + Path(filename).name, delete=True) as tmp:
+    with tempfile.NamedTemporaryFile(
+        prefix=f"archive-{job_id}-",
+        suffix="-" + Path(filename).name,
+        delete=True,
+    ) as tmp:
         client.download_fileobj(STORAGE_BUCKET, key, tmp)
         tmp.flush()
         tmp.seek(0)
+
         size_mb = int(size) / (1024 * 1024)
         size_text = f"{size_mb:.1f} MB"
         caption = (
             "✅ Download complete\n\n"
             f"📄 {filename}\n"
             f"📦 {size_text}"
-        )
-        encoder = MultipartEncoder(fields={
-            "chat_id": str(ARCHIVE_CHAT_ID),
-            "caption": caption[:1024],
-            "document": (filename, tmp, content_type or "application/octet-stream"),
-        })
-        result = telegram_post_form("sendDocument", encoder, timeout=(15, 600))
+        )[:1024]
+
+        inline_video = is_telegram_inline_video(filename, content_type)
+        result = None
+        media_type = "document"
+
+        # sendVideo makes Telegram render an inline video player/thumbnail.
+        # If Telegram rejects a particular MP4/codec, fall back safely to a
+        # normal document instead of losing the delivery.
+        if inline_video:
+            encoder = MultipartEncoder(fields={
+                "chat_id": str(ARCHIVE_CHAT_ID),
+                "caption": caption,
+                "supports_streaming": "true",
+                "video": (filename, tmp, content_type or "video/mp4"),
+            })
+            try:
+                result = telegram_post_form("sendVideo", encoder, timeout=(15, 600))
+                media_type = "video"
+            except Exception:
+                log.exception("Telegram sendVideo failed; falling back to sendDocument")
+                tmp.seek(0)
+
+        if result is None:
+            encoder = MultipartEncoder(fields={
+                "chat_id": str(ARCHIVE_CHAT_ID),
+                "caption": caption,
+                "document": (filename, tmp, content_type or "application/octet-stream"),
+            })
+            result = telegram_post_form("sendDocument", encoder, timeout=(15, 600))
 
     message_id = int(result.get("message_id"))
-    document = result.get("document") or {}
-    file_id = str(document.get("file_id") or "")
+    media_obj = result.get("video") if media_type == "video" else result.get("document")
+    media_obj = media_obj or {}
+    file_id = str(media_obj.get("file_id") or "")
+
     copy = telegram_api(
         "copyMessage",
         data={
@@ -584,13 +629,16 @@ def archive_small_file(job_id, chat_id, key, filename, content_type, size):
         },
         timeout=(15, 60),
     )
+
     if DELETE_R2_AFTER_TELEGRAM_ARCHIVE:
         try:
             client.delete_object(Bucket=STORAGE_BUCKET, Key=key)
         except Exception:
             log.exception("Could not delete archived R2 object %s", key)
+
     return {
         "delivery_mode": "telegram_archive_copy",
+        "delivery_media_type": media_type,
         "archive_message_id": message_id,
         "telegram_file_id": file_id,
         "user_message_id": int((copy or {}).get("message_id") or 0),
@@ -708,7 +756,7 @@ def set_job(job_id, **fields):
         if any(k in fields for k in {
             "status", "progress", "filename", "size", "worker_count",
             "fragment_workers", "telegram_upload_progress",
-            "delivery_status", "delivery_mode", "error",
+            "delivery_status", "delivery_mode", "delivery_media_type", "error",
         }):
             maybe_push_status(job_id)
 
@@ -1099,181 +1147,6 @@ def ytdlp_js_runtime_options():
 
 
 
-class ProviderError(RuntimeError):
-    pass
-
-
-def _provider_request(method, url, *, headers=None, json_body=None, params=None):
-    """Small retry wrapper for provider APIs.
-
-    Only network errors and 5xx responses are retried. 4xx responses (notably
-    401/403/429) are returned immediately so Fattle does not hammer a provider
-    that is rejecting or rate-limiting the request.
-    """
-    last_error = None
-    attempts = PROVIDER_RETRIES + 1
-    for attempt in range(attempts):
-        try:
-            r = requests.request(
-                method,
-                url,
-                headers=headers or {},
-                json=json_body,
-                params=params,
-                timeout=(10, PROVIDER_TIMEOUT_SECONDS),
-                allow_redirects=False,
-            )
-            if r.status_code < 500:
-                return r
-            last_error = ProviderError(f"Provider returned HTTP {r.status_code}")
-        except requests.RequestException as exc:
-            last_error = ProviderError(f"Provider request failed: {exc}")
-        if attempt + 1 < attempts:
-            time.sleep(min(2 ** attempt, 3))
-    raise last_error or ProviderError("Provider request failed")
-
-
-def _cobalt_headers():
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "FattleDownloader/1.7",
-    }
-    if COBALT_API_KEY:
-        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
-    return headers
-
-
-def _cobalt_quality(quality):
-    q = str(quality or "best").strip().lower()
-    if q in {"audio", "audio only", "mp3", "m4a"}:
-        return "max", "audio"
-    if q in {"best", "max", "highest", "original"}:
-        return "max", "auto"
-    m = re.search(r"(144|240|360|480|720|1080|1440|2160|4320)", q)
-    return (m.group(1) if m else "1080"), "auto"
-
-
-def cobalt_resolve(source_url, quality):
-    if not COBALT_API_URL:
-        raise ProviderError("Cobalt provider is not configured")
-    video_quality, download_mode = _cobalt_quality(quality)
-    payload = {
-        "url": source_url,
-        "videoQuality": video_quality,
-        "downloadMode": download_mode,
-        "audioFormat": "best",
-        "filenameStyle": "basic",
-        "youtubeVideoContainer": "mp4",
-        "localProcessing": "disabled",
-    }
-    r = _provider_request(
-        "POST", COBALT_API_URL + "/", headers=_cobalt_headers(), json_body=payload
-    )
-    if r.status_code == 429:
-        raise ProviderError("Cobalt is rate-limiting requests. Please try again later.")
-    if r.status_code in {401, 403}:
-        raise ProviderError("Cobalt rejected the API credentials or request.")
-    if r.status_code >= 400:
-        try:
-            error_data = r.json()
-        except Exception:
-            error_data = {}
-        err = error_data.get("error") if isinstance(error_data, dict) and isinstance(error_data.get("error"), dict) else {}
-        code = str(err.get("code") or "").strip()
-        context = err.get("context") if isinstance(err.get("context"), dict) else {}
-        service = str(context.get("service") or "").strip()
-        detail = code or f"HTTP {r.status_code}"
-        if service:
-            detail += f"; service={service}"
-        raise ProviderError(f"Cobalt could not resolve this media ({detail})")
-    try:
-        data = r.json()
-    except Exception as exc:
-        raise ProviderError("Cobalt returned an invalid response") from exc
-
-    status = str(data.get("status") or "").lower()
-    if status in {"redirect", "tunnel"}:
-        direct = str(data.get("url") or "").strip()
-        if not direct:
-            raise ProviderError("Cobalt did not return a download URL")
-        validate_public_url(direct)
-        source_headers = {}
-        if normalize_host(urlparse(direct).hostname) == normalize_host(urlparse(COBALT_API_URL).hostname):
-            source_headers = _cobalt_headers()
-            source_headers.pop("Content-Type", None)
-            source_headers.pop("Accept", None)
-        return {
-            "url": direct,
-            "filename": str(data.get("filename") or "").strip() or None,
-            "headers": source_headers,
-            "provider": "cobalt",
-            "provider_status": status,
-        }
-
-    if status == "picker":
-        want_audio = _cobalt_quality(quality)[1] == "audio"
-        if want_audio and data.get("audio"):
-            direct = str(data.get("audio") or "").strip()
-            filename = str(data.get("audioFilename") or "audio.m4a")
-        else:
-            items = data.get("picker") if isinstance(data.get("picker"), list) else []
-            item = next((x for x in items if isinstance(x, dict) and x.get("type") in {"video", "gif"}), None)
-            if item is None:
-                raise ProviderError("This post contains multiple images/items; multi-item Cobalt picker downloads are not supported yet")
-            direct = str(item.get("url") or "").strip()
-            filename = None
-        validate_public_url(direct)
-        return {"url": direct, "filename": filename, "headers": {}, "provider": "cobalt", "provider_status": status}
-
-    if status == "local-processing":
-        raise ProviderError("Cobalt requires local media processing for this result")
-
-    if status == "error":
-        err = data.get("error") if isinstance(data.get("error"), dict) else {}
-        code = str(err.get("code") or "unknown")
-        raise ProviderError(f"Cobalt could not resolve this media ({code})")
-
-    raise ProviderError(f"Unsupported Cobalt response: {status or 'unknown'}")
-
-
-def terabox_resolve(source_url):
-    if not TERABOX_API_URL:
-        raise ProviderError("TeraBox provider is not configured")
-    r = _provider_request(
-        "GET",
-        TERABOX_API_URL + "/api",
-        headers={"Accept": "application/json", "User-Agent": "FattleDownloader/1.7"},
-        params={"url": source_url, "resolve": "true"},
-    )
-    if r.status_code == 429:
-        raise ProviderError("TeraBox resolver is rate-limiting requests. Please try again later.")
-    if r.status_code >= 400:
-        raise ProviderError(f"TeraBox resolver returned HTTP {r.status_code}")
-    try:
-        data = r.json()
-    except Exception as exc:
-        raise ProviderError("TeraBox resolver returned an invalid response") from exc
-    if str(data.get("status") or "").lower() != "success":
-        raise ProviderError(str(data.get("message") or "TeraBox resolver could not resolve this share"))
-    files = data.get("files") if isinstance(data.get("files"), list) else []
-    downloadable = [x for x in files if isinstance(x, dict) and x.get("download_link")]
-    if not downloadable:
-        raise ProviderError("TeraBox share contains no downloadable file")
-    if len(downloadable) != 1:
-        raise ProviderError("TeraBox folders/multi-file shares are not supported yet; send a single-file share")
-    item = downloadable[0]
-    direct = str(item.get("download_link") or "").strip()
-    validate_public_url(direct)
-    raw_size = item.get("size")
-    size = int(raw_size) if isinstance(raw_size, (int, float)) or (isinstance(raw_size, str) and raw_size.isdigit()) else None
-    return {
-        "url": direct,
-        "filename": str(item.get("filename") or "").strip() or None,
-        "size": size,
-        "headers": {},
-        "provider": "terabox",
-    }
 
 def ytdlp_format(quality):
     """Prefer the requested quality, but always keep a general fallback.
@@ -1638,28 +1511,31 @@ def run_direct_job(job_id, request: JobCreate):
     )
 
 
-def run_cobalt_job(job_id, request: JobCreate):
+def run_provider_media_job(job_id, request: JobCreate):
     media_quality = "best" if str(request.quality or "").lower() == "original" else request.quality
+    platform = detect_platform(request.url)
     set_job(
         job_id,
         status="resolving_provider",
         source_type="media",
-        provider="cobalt",
+        provider=f"router:{platform}",
         progress=3,
         requested_quality=media_quality,
         worker_count=0,
         fragment_workers=0,
     )
-    resolved = cobalt_resolve(request.url, media_quality)
+    resolved = PROVIDER_ROUTER.resolve_media(request.url, media_quality)
+    validate_public_url(resolved.url)
+    set_job(job_id, provider=resolved.provider)
     return run_resolved_direct_job(
         job_id,
         request,
-        resolved["url"],
-        source_headers=resolved.get("headers") or {},
-        source_type="cobalt",
+        resolved.url,
+        source_headers=resolved.headers or {},
+        source_type=platform,
         requested_quality=media_quality,
-        filename_hint=resolved.get("filename"),
-        provider="cobalt",
+        filename_hint=resolved.filename,
+        provider=resolved.provider,
         allow_unknown_size=True,
     )
 
@@ -1675,16 +1551,17 @@ def run_terabox_provider_job(job_id, request: JobCreate):
         worker_count=0,
         fragment_workers=0,
     )
-    resolved = terabox_resolve(request.url)
+    resolved = PROVIDER_ROUTER.resolve_terabox(request.url)
+    validate_public_url(resolved.url)
     return run_resolved_direct_job(
         job_id,
         request,
-        resolved["url"],
-        source_headers=resolved.get("headers") or {},
+        resolved.url,
+        source_headers=resolved.headers or {},
         source_type="terabox",
         requested_quality="original",
-        filename_hint=resolved.get("filename"),
-        provider="terabox",
+        filename_hint=resolved.filename,
+        provider=resolved.provider,
         allow_unknown_size=True,
     )
 
@@ -1727,17 +1604,17 @@ def run_youtube_job(job_id, request: JobCreate):
 
 
 def run_media_job(job_id, request: JobCreate):
-    """Primary media route: Cobalt first when configured, yt-dlp fallback."""
-    if COBALT_API_URL:
-        try:
-            return run_cobalt_job(job_id, request)
-        except Exception as exc:
-            log.warning("Cobalt provider failed for %s: %s", job_id, exc)
-            set_job(job_id, provider_error=str(exc)[:500])
-            if not PROVIDER_FALLBACK_YTDLP:
-                raise
-            set_job(job_id, status="provider_fallback", progress=4, provider="yt-dlp")
-    return run_ytdlp_media_job(job_id, request)
+    """Resolve through the platform router, then optionally fall back to yt-dlp."""
+    try:
+        return run_provider_media_job(job_id, request)
+    except ProviderError as exc:
+        platform = detect_platform(request.url)
+        log.warning("Provider router failed for %s (%s): %s", job_id, platform, exc)
+        set_job(job_id, provider_error=str(exc)[:700])
+        if not PROVIDER_FALLBACK_YTDLP:
+            raise
+        set_job(job_id, status="provider_fallback", progress=4, provider="yt-dlp")
+        return run_ytdlp_media_job(job_id, request)
 
 
 def run_job(job_id, request: JobCreate):
@@ -1751,13 +1628,13 @@ def run_job(job_id, request: JobCreate):
         if kind == "media":
             run_media_job(job_id, request)
         elif kind == "terabox":
-            if TERABOX_API_URL:
+            if PROVIDER_ROUTER.terabox.configured:
                 try:
                     run_terabox_provider_job(job_id, request)
                 except Exception as exc:
                     log.warning("TeraBox provider failed for %s: %s", job_id, exc)
                     set_job(job_id, provider_error=str(exc)[:500])
-                    # Preserve support for already-direct public TeraBox links.
+                    # Preserve already-direct public TeraBox links only.
                     try:
                         run_direct_job(job_id, request)
                     except Exception:
@@ -1808,8 +1685,7 @@ def root():
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
         "providers": {
-            "cobalt": bool(COBALT_API_URL),
-            "terabox": bool(TERABOX_API_URL),
+            **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
         },
     }
@@ -1826,8 +1702,7 @@ def health():
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
         "providers": {
-            "cobalt": bool(COBALT_API_URL),
-            "terabox": bool(TERABOX_API_URL),
+            **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
         },
     }
@@ -1871,26 +1746,45 @@ def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(defau
 
     kind = source_kind(body.url)
     if kind == "media":
+        platform = detect_platform(body.url)
+        provider_status = PROVIDER_ROUTER.status()
+        if platform == "youtube":
+            configured = [
+                name for name in provider_status["youtube"]["order"]
+                if provider_status["youtube"].get(name) is True
+            ]
+            provider_name = configured[0] if configured else (
+                "yt-dlp" if PROVIDER_FALLBACK_YTDLP else "unconfigured"
+            )
+        else:
+            provider_name = "cobalt" if provider_status["social"]["cobalt"] else (
+                "yt-dlp" if PROVIDER_FALLBACK_YTDLP else "unconfigured"
+            )
         return {
             "ok": True,
             "kind": "media",
-            "source_type": "media",
-            "provider": "cobalt" if COBALT_API_URL else "yt-dlp",
+            "source_type": platform,
+            "provider": provider_name,
         }
 
-    if kind == "terabox" and TERABOX_API_URL:
+    if kind == "terabox" and PROVIDER_ROUTER.terabox.configured:
         try:
-            resolved = terabox_resolve(body.url)
+            resolved = PROVIDER_ROUTER.resolve_terabox(body.url)
+            validate_public_url(resolved.url)
             # Probe only the resolved public file. The direct URL itself is not
             # returned to Vercel and will be resolved again when the job starts.
-            info = probe_direct(resolved["url"], extra_headers=resolved.get("headers") or {})
+            info = probe_direct(
+                resolved.url,
+                extra_headers=resolved.headers or {},
+                allow_unknown_size=True,
+            )
             return {
                 "ok": True,
                 "kind": "direct",
                 "source_type": "terabox",
-                "provider": "terabox",
-                "filename": resolved.get("filename") or info.get("filename"),
-                "size": info.get("size"),
+                "provider": resolved.provider,
+                "filename": resolved.filename or info.get("filename"),
+                "size": info.get("size") or info.get("estimated_size"),
                 "content_type": info.get("content_type"),
                 "range": bool(info.get("range")),
                 "worker_count": choose_part_count(int(info.get("size") or 0), bool(info.get("range"))),
