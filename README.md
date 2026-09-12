@@ -527,3 +527,57 @@ Additional protections:
 - fixes Telegram status-message line breaks;
 - makes Deno installation optional/best-effort when provider fallback is disabled;
 - `/health` includes build ID, configured worker count, storage state, and configuration warnings.
+
+
+# v3.5 — MTProto bot archive resolver fix
+
+Large-file Telegram delivery no longer calls `client.iter_dialogs()`.
+
+Bot accounts are restricted from Telegram's dialog-enumeration request. The
+archive channel is now resolved directly from the configured Bot API-style
+`ARCHIVE_CHAT_ID` with `client.get_input_entity(...)`, then the existing
+MTProto upload and Bot API `copyMessage` flow continues normally.
+
+
+# v3.6 — speed profile
+
+For sources that do not support real byte ranges, Fattle still uses one source
+connection, but it no longer pauses that connection while each R2 multipart
+part uploads.
+
+```text
+provider/CDN single stream
+          |
+          +----> R2 part 1 upload
+          +----> R2 part 2 upload
+          +----> R2 part 3 upload
+          ...
+```
+
+Default R2 stream upload concurrency is 3.
+
+Telegram's small-file path now tries the hosted Bot API up to 50 MiB and falls
+back to MTProto if Telegram rejects the upload. MTProto's R2 read buffer is now
+16 MiB by default and Telegram progress persistence is less chatty.
+
+
+# v3.7 — true live Telegram pipeline
+
+For single-stream sources with an exact HTTP size, the same source bytes now
+flow to R2 and Telegram at the same time:
+
+```text
+provider/CDN
+     |
+     +----> R2 multipart pipeline
+     |
+     +----> Telegram MTProto 512 KiB parts
+```
+
+Telegram's upload starts before the source download is complete.
+
+Safety behavior:
+- if the live Telegram path fails, the source/R2 download continues;
+- after R2 finishes, the existing R2 -> Telegram delivery stack is used;
+- no live pipeline is started when the source size is unknown;
+- 4-worker byte-range sources keep their normal high-speed range path.

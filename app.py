@@ -5,6 +5,8 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
+import queue
 import mimetypes
 import os
 import re
@@ -31,7 +33,7 @@ import yt_dlp
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from requests_toolbelt.multipart.encoder import MultipartEncoder
-from telethon import TelegramClient, utils as telethon_utils
+from telethon import TelegramClient, functions, types, utils as telethon_utils
 from telethon.sessions import StringSession
 from providers import ProviderError, ProviderRouter, detect_platform, ROUTER_BUILD
 
@@ -69,7 +71,7 @@ ARCHIVE_CHAT_ID = os.getenv("ARCHIVE_CHAT_ID", "").strip()
 TELEGRAM_API_RETRIES = max(1, min(5, int(os.getenv("TELEGRAM_API_RETRIES", "3"))))
 
 # Normal Bot API for small-file upload and Telegram server-side copyMessage.
-TELEGRAM_DIRECT_MAX_BYTES = int(os.getenv("TELEGRAM_DIRECT_MAX_BYTES", "49000000"))
+TELEGRAM_DIRECT_MAX_BYTES = int(os.getenv("TELEGRAM_DIRECT_MAX_BYTES", str(50 * 1024 * 1024)))
 
 # MTProto for larger archive uploads.
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
@@ -77,7 +79,27 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 TELEGRAM_MTPROTO_MAX_BYTES = int(os.getenv("TELEGRAM_MTPROTO_MAX_BYTES", "1900000000"))
 MTPROTO_R2_BUFFER_BYTES = max(
     1024 * 1024,
-    min(32 * 1024 * 1024, int(os.getenv("MTPROTO_R2_BUFFER_BYTES", str(8 * 1024 * 1024))))
+    min(32 * 1024 * 1024, int(os.getenv("MTPROTO_R2_BUFFER_BYTES", str(16 * 1024 * 1024))))
+)
+
+# True source -> Telegram pipelining for non-range/single-stream downloads.
+# Telegram MTProto parts are 512 KiB maximum. The queue provides bounded
+# backpressure while still letting source, R2 and Telegram overlap.
+LIVE_TELEGRAM_PIPELINE = os.getenv(
+    "LIVE_TELEGRAM_PIPELINE", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
+LIVE_TELEGRAM_PART_BYTES = 512 * 1024
+LIVE_TELEGRAM_MIN_BYTES = max(
+    1024 * 1024,
+    min(64 * 1024 * 1024, int(os.getenv("LIVE_TELEGRAM_MIN_BYTES", str(8 * 1024 * 1024))))
+)
+LIVE_TELEGRAM_QUEUE_PARTS = max(
+    4,
+    min(128, int(os.getenv("LIVE_TELEGRAM_QUEUE_PARTS", "48")))
+)
+LIVE_TELEGRAM_FINISH_TIMEOUT_SECONDS = max(
+    60,
+    min(3600, int(os.getenv("LIVE_TELEGRAM_FINISH_TIMEOUT_SECONDS", "1200")))
 )
 
 R2_LINK_TTL_SECONDS = max(300, min(604800, int(os.getenv("R2_LINK_TTL_SECONDS", "86400"))))
@@ -92,6 +114,18 @@ MIN_MULTIPART_PART = 5 * 1024 * 1024
 R2_STREAM_PART_BYTES = max(
     MIN_MULTIPART_PART,
     min(64 * 1024 * 1024, int(os.getenv("R2_STREAM_PART_BYTES", str(8 * 1024 * 1024))))
+)
+
+# Non-range source -> R2 pipeline.
+# One source connection is still used, but R2 uploads happen concurrently so
+# the source download does not pause for every multipart upload.
+R2_STREAM_UPLOAD_WORKERS = max(
+    1,
+    min(4, int(os.getenv("R2_STREAM_UPLOAD_WORKERS", "3")))
+)
+R2_STREAM_INFLIGHT_PARTS = max(
+    R2_STREAM_UPLOAD_WORKERS,
+    min(8, int(os.getenv("R2_STREAM_INFLIGHT_PARTS", "6")))
 )
 MAX_WORKERS_PER_JOB = 4
 
@@ -110,7 +144,7 @@ STREAM_DOWNLOAD_RETRIES = max(1, min(5, int(os.getenv("STREAM_DOWNLOAD_RETRIES",
 WORKER_CALL_RETRIES = max(1, min(6, int(os.getenv("WORKER_CALL_RETRIES", "4"))))
 WORKER_CALL_BACKOFF_SECONDS = max(0.5, min(10.0, float(os.getenv("WORKER_CALL_BACKOFF_SECONDS", "1.5"))))
 MONGO_STATUS_RETRIES = max(1, min(4, int(os.getenv("MONGO_STATUS_RETRIES", "2"))))
-DOWNLOADER_BUILD = "3.4-stability"
+DOWNLOADER_BUILD = "3.7-live-telegram-pipeline"
 
 MAX_ACTIVE_JOBS = max(1, min(16, int(os.getenv("MAX_ACTIVE_JOBS", "2"))))
 _job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -494,17 +528,393 @@ def is_telegram_inline_video(filename, content_type=None):
 
 
 async def _resolve_archive_entity(client):
+    """Resolve the private archive channel without enumerating bot dialogs."""
+    if not ARCHIVE_CHAT_ID:
+        raise RuntimeError("ARCHIVE_CHAT_ID is not configured")
+
     wanted = int(ARCHIVE_CHAT_ID)
-    async for dialog in client.iter_dialogs():
+
+    try:
+        # Telethon special-cases bot accounts here and can resolve a numeric
+        # channel ID through channels.GetChannelsRequest without GetDialogs.
+        return await client.get_input_entity(wanted)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not resolve ARCHIVE_CHAT_ID with the bot account. "
+            "Make sure this same bot is in the private archive channel, is an "
+            "administrator, and can post messages. "
+            f"ARCHIVE_CHAT_ID={wanted}. Telegram error: {exc}"
+        ) from exc
+
+
+class LiveTelegramUploader:
+    """Upload sequential source bytes to Telegram while R2 is still receiving.
+
+    This uploader is best-effort. A Telegram-side failure must never destroy the
+    source/R2 download; callers can disable it and fall back to the normal
+    R2 -> Telegram delivery path.
+    """
+
+    _STOP = object()
+
+    def __init__(self, job_id, filename, content_type, exact_size):
+        self.job_id = str(job_id)
+        self.filename = str(filename or "download.bin")
+        self.content_type = str(content_type or "application/octet-stream")
+        self.size = int(exact_size)
+        if self.size <= 0:
+            raise ValueError("Live Telegram upload requires an exact positive size")
+
+        self.part_size = LIVE_TELEGRAM_PART_BYTES
+        self.total_parts = int(math.ceil(self.size / self.part_size))
+        self.is_big = self.size > 10 * 1024 * 1024
+
+        # Positive signed 63-bit random ID is valid for Telegram's `long`.
+        self.file_id = int.from_bytes(os.urandom(8), "little") & ((1 << 63) - 1)
+        if self.file_id == 0:
+            self.file_id = 1
+
+        self._queue = queue.Queue(maxsize=LIVE_TELEGRAM_QUEUE_PARTS)
+        self._buffer = bytearray()
+        self._source_bytes = 0
+        self._queued_parts = 0
+        self._abort = threading.Event()
+        self._done = threading.Event()
+        self._closed = False
+        self._error = None
+        self._result = None
+
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name=f"tg-live-{self.job_id[:8]}",
+            daemon=True,
+        )
+
+    @property
+    def error(self):
+        return self._error
+
+    @property
+    def result(self):
+        return self._result
+
+    @property
+    def alive(self):
+        return self._thread.is_alive() and not self._done.is_set()
+
+    def start(self):
+        self._thread.start()
+        set_job(
+            self.job_id,
+            telegram_live_pipeline=True,
+            telegram_live_total_bytes=self.size,
+            telegram_upload_progress=0,
+        )
+        return self
+
+    def _put(self, item):
+        while not self._abort.is_set():
+            if self._done.is_set():
+                return False
+            try:
+                self._queue.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                try:
+                    raise_if_cancelled(self.job_id)
+                except Exception:
+                    self.abort()
+                    raise
+                continue
+        return False
+
+    def feed(self, data):
+        """Feed sequential bytes. Returns False if Telegram pipeline has failed."""
+        if self._closed or self._abort.is_set() or self._done.is_set():
+            return False
+        if self._error is not None:
+            return False
+        if not data:
+            return True
+
+        data = bytes(data)
+        self._source_bytes += len(data)
+        if self._source_bytes > self.size:
+            self._error = RuntimeError(
+                f"Live Telegram source exceeded exact size: {self._source_bytes}>{self.size}"
+            )
+            self.abort()
+            return False
+
+        self._buffer.extend(data)
+        while len(self._buffer) >= self.part_size:
+            payload = bytes(self._buffer[:self.part_size])
+            del self._buffer[:self.part_size]
+            index = self._queued_parts
+            if index >= self.total_parts:
+                self._error = RuntimeError("Too many Telegram file parts were produced")
+                self.abort()
+                return False
+            if not self._put((index, payload)):
+                return False
+            self._queued_parts += 1
+
+        return self._error is None
+
+    def close_input(self):
+        """Signal source EOF without waiting for Telegram finalization."""
+        if self._closed:
+            return
+        self._closed = True
+
+        if self._source_bytes != self.size:
+            self._error = RuntimeError(
+                f"Live Telegram source size mismatch: expected {self.size}, got {self._source_bytes}"
+            )
+            self.abort()
+            return
+
+        if self._buffer:
+            index = self._queued_parts
+            if index >= self.total_parts:
+                self._error = RuntimeError("Unexpected final Telegram file part")
+                self.abort()
+                return
+            if not self._put((index, bytes(self._buffer))):
+                return
+            self._queued_parts += 1
+            self._buffer.clear()
+
+        if self._queued_parts != self.total_parts:
+            self._error = RuntimeError(
+                f"Telegram part count mismatch: expected {self.total_parts}, "
+                f"queued {self._queued_parts}"
+            )
+            self.abort()
+            return
+
+        self._put(self._STOP)
+
+    def abort(self):
+        self._abort.set()
+        # Consumer uses a timed get, so it will notice the abort even if the
+        # queue is full and no STOP marker can be inserted.
         try:
-            if int(telethon_utils.get_peer_id(dialog.entity)) == wanted:
-                return dialog.entity
+            self._queue.put_nowait(self._STOP)
         except Exception:
-            continue
-    raise RuntimeError(
-        "Archive channel was not found. Add the bot as an admin of the private "
-        "channel and allow it to post messages."
+            pass
+
+    def wait(self, timeout=None):
+        timeout = (
+            LIVE_TELEGRAM_FINISH_TIMEOUT_SECONDS
+            if timeout is None
+            else float(timeout)
+        )
+        if not self._done.wait(timeout):
+            self.abort()
+            raise RuntimeError("Timed out waiting for live Telegram upload to finish")
+        if self._error is not None:
+            raise RuntimeError(f"Live Telegram upload failed: {self._error}") from self._error
+        if not self._result:
+            raise RuntimeError("Live Telegram upload ended without an archive message")
+        return dict(self._result)
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._async_main())
+        except Exception as exc:
+            self._error = exc
+            log.exception("Live Telegram pipeline failed for job %s", self.job_id)
+            set_job(
+                self.job_id,
+                telegram_live_pipeline=False,
+                telegram_live_error=str(exc)[:1000],
+            )
+        finally:
+            self._done.set()
+
+    async def _async_main(self):
+        client = TelegramClient(
+            StringSession(),
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+            connection_retries=5,
+            request_retries=5,
+        )
+
+        uploaded_bytes = 0
+        uploaded_parts = 0
+        hash_md5 = hashlib.md5()
+        archive_message_id = 0
+
+        await client.start(bot_token=BOT_TOKEN)
+        try:
+            archive_entity = await _resolve_archive_entity(client)
+
+            while not self._abort.is_set():
+                try:
+                    item = await asyncio.to_thread(self._queue.get, True, 0.5)
+                except queue.Empty:
+                    continue
+
+                if item is self._STOP:
+                    break
+
+                part_index, payload = item
+                if part_index != uploaded_parts:
+                    raise RuntimeError(
+                        f"Telegram parts arrived out of order: expected {uploaded_parts}, "
+                        f"got {part_index}"
+                    )
+
+                if part_index < self.total_parts - 1 and len(payload) != self.part_size:
+                    raise RuntimeError(
+                        f"Telegram part {part_index} has invalid size {len(payload)}"
+                    )
+                if len(payload) <= 0 or len(payload) > self.part_size:
+                    raise RuntimeError(
+                        f"Telegram part {part_index} has invalid payload size {len(payload)}"
+                    )
+
+                if self.is_big:
+                    ok = await client(
+                        functions.upload.SaveBigFilePartRequest(
+                            file_id=self.file_id,
+                            file_part=part_index,
+                            file_total_parts=self.total_parts,
+                            bytes=payload,
+                        )
+                    )
+                else:
+                    hash_md5.update(payload)
+                    ok = await client(
+                        functions.upload.SaveFilePartRequest(
+                            file_id=self.file_id,
+                            file_part=part_index,
+                            bytes=payload,
+                        )
+                    )
+
+                if not ok:
+                    raise RuntimeError(f"Telegram rejected file part {part_index}")
+
+                uploaded_parts += 1
+                uploaded_bytes += len(payload)
+                percent = min(99, int(uploaded_bytes * 100 / max(1, self.size)))
+
+                # Limit Mongo writes while still showing useful live progress.
+                if percent == 99 or percent % 5 == 0:
+                    set_job(
+                        self.job_id,
+                        telegram_live_pipeline=True,
+                        telegram_upload_progress=percent,
+                        telegram_uploaded_bytes=uploaded_bytes,
+                    )
+
+            if self._abort.is_set():
+                return
+
+            if uploaded_parts != self.total_parts:
+                raise RuntimeError(
+                    f"Telegram upload ended early: {uploaded_parts}/{self.total_parts} parts"
+                )
+            if uploaded_bytes != self.size:
+                raise RuntimeError(
+                    f"Telegram upload byte mismatch: expected {self.size}, got {uploaded_bytes}"
+                )
+
+            if self.is_big:
+                uploaded = types.InputFileBig(
+                    self.file_id,
+                    self.total_parts,
+                    self.filename,
+                )
+            else:
+                uploaded = types.InputFile(
+                    self.file_id,
+                    self.total_parts,
+                    self.filename,
+                    hash_md5.hexdigest(),
+                )
+
+            size_mb = self.size / (1024 * 1024)
+            size_text = (
+                f"{size_mb / 1024:.2f} GB"
+                if size_mb >= 1024
+                else f"{size_mb:.1f} MB"
+            )
+            caption = (
+                "✅ Download complete\n\n"
+                f"📄 {self.filename}\n"
+                f"📦 {size_text}"
+            )[:1024]
+
+            inline_video = is_telegram_inline_video(
+                self.filename,
+                self.content_type,
+            )
+            message = await client.send_file(
+                archive_entity,
+                uploaded,
+                caption=caption,
+                force_document=not inline_video,
+                supports_streaming=inline_video,
+                mime_type=self.content_type,
+            )
+            archive_message_id = int(message.id)
+
+            self._result = {
+                "archive_message_id": archive_message_id,
+                "delivery_media_type": "video" if inline_video else "document",
+                "telegram_upload_progress": 100,
+                "telegram_live_pipeline": True,
+            }
+            set_job(
+                self.job_id,
+                telegram_upload_progress=100,
+                telegram_live_archive_message_id=archive_message_id,
+            )
+
+        finally:
+            await client.disconnect()
+
+
+def _copy_live_archive_to_user(job_id, chat_id, key, live_result):
+    """Finish a successful live archive upload with server-side copyMessage."""
+    message_id = int((live_result or {}).get("archive_message_id") or 0)
+    if message_id <= 0:
+        raise RuntimeError("Live Telegram archive message ID is missing")
+
+    copied = telegram_api(
+        "copyMessage",
+        data={
+            "chat_id": str(int(chat_id)),
+            "from_chat_id": str(ARCHIVE_CHAT_ID),
+            "message_id": str(message_id),
+        },
+        timeout=(15, 90),
     )
+
+    result = {
+        "delivery_mode": "telegram_live_mtproto_archive_copy",
+        "delivery_media_type": str(
+            (live_result or {}).get("delivery_media_type") or "document"
+        ),
+        "archive_message_id": message_id,
+        "user_message_id": int((copied or {}).get("message_id") or 0),
+        "telegram_upload_progress": 100,
+        "telegram_live_pipeline": True,
+    }
+
+    set_job(job_id, delivery_status="sent", **result)
+
+    if DELETE_R2_AFTER_TELEGRAM_ARCHIVE:
+        try:
+            s3().delete_object(Bucket=STORAGE_BUCKET, Key=key)
+        except Exception:
+            log.exception("Could not delete live-archived R2 object %s", key)
+
+    return result
 
 
 async def _archive_large_mtproto_async(job_id, key, filename, content_type, size):
@@ -541,7 +951,7 @@ async def _archive_large_mtproto_async(job_id, key, filename, content_type, size
         def progress(current, total):
             total = max(1, int(total or size))
             percent = min(100, int(int(current) * 100 / total))
-            if percent >= last_report["percent"] + 2 or percent == 100:
+            if percent >= last_report["percent"] + 5 or percent == 100:
                 last_report["percent"] = percent
                 set_job(
                     job_id,
@@ -1238,15 +1648,15 @@ class StreamIntegrityError(RuntimeError):
     """A full-file stream was partial or internally inconsistent."""
 
 
-def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
-    """Stream a non-range/unknown-size source into R2 using multipart upload.
+def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None, live_telegram=None):
+    """Pipeline one source stream into concurrent R2 multipart uploads.
 
-    No whole file is written to local disk. The actual byte count is measured
-    while streaming and MAX_FILE_BYTES is enforced even when the origin did not
-    provide Content-Length.
+    The source may not support Range, so it is read through one safe HTTP
+    connection. R2 multipart uploads run concurrently in the background,
+    preventing each R2 upload from pausing the source download.
     """
     headers = {
-        "User-Agent": "FattleDownloader/1.0",
+        "User-Agent": "FattleDownloader/3.6",
         "Accept-Encoding": "identity",
     }
     headers.update(source_headers or {})
@@ -1255,9 +1665,14 @@ def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, c
     upload_id = None
     received = 0
     last_reported = -1
-    parts = []
     part_number = 1
     buffer = bytearray()
+    executor = None
+    pending = {}
+    completed_parts = []
+    live_uploader = None
+    live_result = None
+
     try:
         if response.status_code not in {200, 206}:
             raise RuntimeError(f"Stream download returned HTTP {response.status_code}")
@@ -1272,14 +1687,12 @@ def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, c
         exact_expected = None
 
         if response.status_code == 206:
-            # A normal whole-file fallback request contains no Range header. If
-            # the origin nevertheless sends 206, accept it only when the
-            # Content-Range proves that this is the entire object from byte 0.
             content_range = str(response.headers.get("Content-Range") or "")
             match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range, re.I)
             if not match or not match.group(3).isdigit():
                 raise StreamIntegrityError(
-                    f"Full stream received incomplete HTTP 206 response: {content_range[:200] or 'missing Content-Range'}"
+                    f"Full stream received incomplete HTTP 206 response: "
+                    f"{content_range[:200] or 'missing Content-Range'}"
                 )
             start_byte = int(match.group(1))
             end_byte = int(match.group(2))
@@ -1300,7 +1713,46 @@ def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, c
 
         expected = exact_expected or response_estimate or estimated_size
         if expected and int(expected) > MAX_FILE_BYTES:
-            raise RuntimeError(f"File is too large ({expected} bytes). Limit is {MAX_FILE_BYTES} bytes")
+            raise RuntimeError(
+                f"File is too large ({expected} bytes). Limit is {MAX_FILE_BYTES} bytes"
+            )
+
+        # True download + Telegram upload overlap is enabled only when HTTP
+        # gives us an exact byte count. Telegram's big-file API requires the
+        # total part count before upload begins. If Telegram setup fails here,
+        # the R2 download continues normally and delivery falls back later.
+        if (
+            LIVE_TELEGRAM_PIPELINE
+            and live_telegram
+            and exact_expected is not None
+            and int(exact_expected) >= LIVE_TELEGRAM_MIN_BYTES
+            and int(exact_expected) <= TELEGRAM_MTPROTO_MAX_BYTES
+            and mtproto_configured()
+        ):
+            try:
+                live_uploader = LiveTelegramUploader(
+                    job_id,
+                    live_telegram.get("filename"),
+                    live_telegram.get("content_type") or content_type,
+                    int(exact_expected),
+                ).start()
+                set_job(
+                    job_id,
+                    telegram_live_pipeline=True,
+                    telegram_live_exact_size=int(exact_expected),
+                )
+            except Exception as exc:
+                live_uploader = None
+                set_job(
+                    job_id,
+                    telegram_live_pipeline=False,
+                    telegram_live_error=str(exc)[:1000],
+                )
+                log.warning(
+                    "Could not start live Telegram pipeline for job %s: %s",
+                    job_id,
+                    exc,
+                )
 
         upload = client.create_multipart_upload(
             Bucket=STORAGE_BUCKET,
@@ -1309,74 +1761,248 @@ def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, c
         )
         upload_id = upload["UploadId"]
 
-        def flush_part(payload):
-            nonlocal part_number
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=R2_STREAM_UPLOAD_WORKERS,
+            thread_name_prefix="r2-stream",
+        )
+
+        def _upload_one(number, payload):
             result = client.upload_part(
                 Bucket=STORAGE_BUCKET,
                 Key=storage_key,
                 UploadId=upload_id,
-                PartNumber=part_number,
-                Body=bytes(payload),
+                PartNumber=number,
+                Body=payload,
                 ContentLength=len(payload),
             )
-            parts.append({"PartNumber": part_number, "ETag": result["ETag"]})
-            part_number += 1
+            return {
+                "PartNumber": number,
+                "ETag": result["ETag"],
+                "bytes": len(payload),
+            }
 
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
+        def _collect_completed(*, block=False):
+            if not pending:
+                return
+
+            mode = (
+                concurrent.futures.FIRST_COMPLETED
+                if block
+                else concurrent.futures.FIRST_COMPLETED
+            )
+            done, _ = concurrent.futures.wait(
+                list(pending.keys()),
+                timeout=None if block else 0,
+                return_when=mode,
+            )
+
+            for fut in done:
+                number = pending.pop(fut)
+                try:
+                    completed_parts.append(fut.result())
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"R2 stream part {number} upload failed: {exc}"
+                    ) from exc
+
+        def _submit_part(payload):
+            nonlocal part_number
+            payload = bytes(payload)
+            number = part_number
+            part_number += 1
+            fut = executor.submit(_upload_one, number, payload)
+            pending[fut] = number
+
+            # Bound memory: if too many parts are waiting, wait only until one
+            # finishes while the remaining R2 uploads continue in parallel.
+            while len(pending) >= R2_STREAM_INFLIGHT_PARTS:
+                raise_if_cancelled(job_id)
+                _collect_completed(block=True)
+
+        # Larger read chunks reduce Python/requests overhead while still keeping
+        # responsive cancellation/status updates.
+        source_read_chunk = min(4 * 1024 * 1024, R2_STREAM_PART_BYTES)
+
+        for chunk in response.iter_content(chunk_size=source_read_chunk):
             if not chunk:
                 continue
+
             received += len(chunk)
             if received > MAX_FILE_BYTES:
-                raise RuntimeError(f"File exceeded the configured limit of {MAX_FILE_BYTES} bytes")
+                raise RuntimeError(
+                    f"File exceeded the configured limit of {MAX_FILE_BYTES} bytes"
+                )
+
+            if live_uploader is not None:
+                try:
+                    if not live_uploader.feed(chunk):
+                        reason = live_uploader.error or "live uploader stopped"
+                        log.warning(
+                            "Disabling live Telegram pipeline for job %s: %s",
+                            job_id,
+                            reason,
+                        )
+                        set_job(
+                            job_id,
+                            telegram_live_pipeline=False,
+                            telegram_live_error=str(reason)[:1000],
+                        )
+                        live_uploader.abort()
+                        live_uploader = None
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "Live Telegram feed failed for job %s; continuing R2: %s",
+                        job_id,
+                        exc,
+                    )
+                    set_job(
+                        job_id,
+                        telegram_live_pipeline=False,
+                        telegram_live_error=str(exc)[:1000],
+                    )
+                    try:
+                        live_uploader.abort()
+                    except Exception:
+                        pass
+                    live_uploader = None
+
             buffer.extend(chunk)
+
             while len(buffer) >= R2_STREAM_PART_BYTES:
                 payload = buffer[:R2_STREAM_PART_BYTES]
                 del buffer[:R2_STREAM_PART_BYTES]
-                flush_part(payload)
+                _submit_part(payload)
+
+            # Harvest completed R2 uploads without waiting.
+            _collect_completed(block=False)
 
             if expected:
-                pct = min(85, 5 + int(80 * min(received, expected) / max(1, expected)))
+                pct = min(
+                    85,
+                    5 + int(80 * min(received, int(expected)) / max(1, int(expected))),
+                )
             else:
-                # Exact percentage is unknowable without a total. Keep the bar
-                # conservative while still exposing downloaded MB in the status.
                 pct = 10
-            report_bucket = received // (4 * 1024 * 1024)
+
+            # Fewer Mongo writes: every 8 MiB instead of every 4 MiB.
+            report_bucket = received // (8 * 1024 * 1024)
             if report_bucket != last_reported:
                 last_reported = report_bucket
                 raise_if_cancelled(job_id)
-                set_job(job_id, progress=pct, downloaded_bytes=received)
+                set_job(
+                    job_id,
+                    progress=pct,
+                    downloaded_bytes=received,
+                    download_mode="single_stream_pipelined",
+                    r2_upload_workers=R2_STREAM_UPLOAD_WORKERS,
+                )
 
         if not received:
             raise RuntimeError("The source returned an empty file")
+
         if exact_expected is not None and received != int(exact_expected):
             raise StreamIntegrityError(
                 f"Incomplete full stream: expected {int(exact_expected)} bytes, got {received}"
             )
+
+        # Source EOF is now known-good. Let Telegram upload/send its last part
+        # while R2 finishes outstanding multipart uploads.
+        if live_uploader is not None:
+            try:
+                live_uploader.close_input()
+            except Exception as exc:
+                log.warning(
+                    "Could not close live Telegram input for job %s: %s",
+                    job_id,
+                    exc,
+                )
+                set_job(
+                    job_id,
+                    telegram_live_pipeline=False,
+                    telegram_live_error=str(exc)[:1000],
+                )
+
         if buffer:
-            flush_part(buffer)
-        if not parts:
+            _submit_part(buffer)
+
+        while pending:
+            raise_if_cancelled(job_id)
+            _collect_completed(block=True)
+
+        if not completed_parts:
             raise RuntimeError("The stream did not produce any upload parts")
+
+        completed_parts.sort(key=lambda p: p["PartNumber"])
 
         client.complete_multipart_upload(
             Bucket=STORAGE_BUCKET,
             Key=storage_key,
             UploadId=upload_id,
-            MultipartUpload={"Parts": parts},
+            MultipartUpload={
+                "Parts": [
+                    {"PartNumber": p["PartNumber"], "ETag": p["ETag"]}
+                    for p in completed_parts
+                ]
+            },
         )
         upload_id = None
-        return {"size": received, "url": final_url}
+
+        if live_uploader is not None:
+            try:
+                live_result = live_uploader.wait()
+            except Exception as exc:
+                log.warning(
+                    "Live Telegram finalization failed for job %s; "
+                    "normal R2 delivery will be used: %s",
+                    job_id,
+                    exc,
+                )
+                set_job(
+                    job_id,
+                    telegram_live_pipeline=False,
+                    telegram_live_error=str(exc)[:1000],
+                )
+                live_result = None
+
+        return {
+            "size": received,
+            "url": final_url,
+            "r2_upload_workers": R2_STREAM_UPLOAD_WORKERS,
+            "download_mode": "single_stream_pipelined",
+            "live_telegram": live_result,
+        }
+
     except Exception:
+        if live_uploader is not None:
+            try:
+                live_uploader.abort()
+            except Exception:
+                pass
+
+        if pending:
+            for fut in pending:
+                fut.cancel()
+
         if upload_id:
             try:
-                client.abort_multipart_upload(Bucket=STORAGE_BUCKET, Key=storage_key, UploadId=upload_id)
+                client.abort_multipart_upload(
+                    Bucket=STORAGE_BUCKET,
+                    Key=storage_key,
+                    UploadId=upload_id,
+                )
             except Exception:
                 pass
         raise
+
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         response.close()
 
 
-def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
+def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None, live_telegram=None):
     """Retry a whole-file stream from scratch when a CDN disconnects.
 
     This path is used for origins that do not reliably honor byte ranges.
@@ -1402,6 +2028,7 @@ def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content
                 storage_key,
                 content_type,
                 estimated_size=estimated_size,
+                live_telegram=live_telegram,
             )
             result["attempts"] = attempt
             return result
@@ -1792,6 +2419,7 @@ def run_resolved_direct_job(
     )
     client = s3()
     key = f"jobs/{job_id}/{filename}"
+    live_delivery = None
 
     # Use the fast multi-worker path only when the origin provided an exact
     # size and actually supports byte ranges. Each request is intentionally
@@ -1955,8 +2583,13 @@ def run_resolved_direct_job(
                     key,
                     probe["content_type"],
                     estimated_size=probe.get("size") or probe.get("estimated_size"),
+                    live_telegram={
+                        "filename": filename,
+                        "content_type": probe["content_type"],
+                    },
                 )
                 final_size = int(streamed["size"])
+                live_delivery = streamed.get("live_telegram")
                 set_job(
                     job_id,
                     size=final_size,
@@ -1980,13 +2613,59 @@ def run_resolved_direct_job(
             key,
             probe["content_type"],
             estimated_size=probe.get("estimated_size") or probe.get("size"),
+            live_telegram={
+                "filename": filename,
+                "content_type": probe["content_type"],
+            },
         )
         final_size = int(streamed["size"])
+        live_delivery = streamed.get("live_telegram")
         set_job(job_id, size=final_size, downloaded_bytes=final_size, progress=85)
 
     set_job(job_id, status="stored", progress=92, storage_key=key, size=final_size)
     raise_if_cancelled(job_id)
-    if maybe_deliver(job_id, request.chat_id, key, filename, probe["content_type"], final_size):
+
+    delivered = False
+    if live_delivery:
+        try:
+            set_job(
+                job_id,
+                status="uploading_telegram",
+                progress=96,
+                telegram_upload_progress=100,
+            )
+            _copy_live_archive_to_user(
+                job_id,
+                request.chat_id,
+                key,
+                live_delivery,
+            )
+            delivered = True
+        except Exception as exc:
+            # Archive upload succeeded but copyMessage failed. Keep the R2
+            # object and use the existing delivery stack as a safe fallback.
+            log.exception(
+                "Live Telegram archive copy failed for job %s; "
+                "falling back to normal R2 delivery",
+                job_id,
+            )
+            set_job(
+                job_id,
+                telegram_live_copy_error=str(exc)[:1000],
+                telegram_live_pipeline=False,
+            )
+
+    if not delivered:
+        delivered = maybe_deliver(
+            job_id,
+            request.chat_id,
+            key,
+            filename,
+            probe["content_type"],
+            final_size,
+        )
+
+    if delivered:
         set_job(job_id, status="complete", progress=100, completed_at=now())
         maybe_push_status(job_id, force=True)
 
@@ -2254,6 +2933,9 @@ def root():
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
         "downloader_build": DOWNLOADER_BUILD,
+        "telegram_live_pipeline": LIVE_TELEGRAM_PIPELINE,
+        "telegram_live_part_bytes": LIVE_TELEGRAM_PART_BYTES,
+        "telegram_live_queue_parts": LIVE_TELEGRAM_QUEUE_PARTS,
         "provider_router_build": ROUTER_BUILD,
         "storage_configured": all((STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)),
         "worker_urls_configured": len(WORKER_URLS),
@@ -2276,6 +2958,9 @@ def health():
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
         "downloader_build": DOWNLOADER_BUILD,
+        "telegram_live_pipeline": LIVE_TELEGRAM_PIPELINE,
+        "telegram_live_part_bytes": LIVE_TELEGRAM_PART_BYTES,
+        "telegram_live_queue_parts": LIVE_TELEGRAM_QUEUE_PARTS,
         "provider_router_build": ROUTER_BUILD,
         "storage_configured": all((STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)),
         "worker_urls_configured": len(WORKER_URLS),
