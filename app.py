@@ -93,6 +93,19 @@ R2_STREAM_PART_BYTES = max(
     min(64 * 1024 * 1024, int(os.getenv("R2_STREAM_PART_BYTES", str(8 * 1024 * 1024))))
 )
 MAX_WORKERS_PER_JOB = 4
+
+# Provider/CDN range downloads can occasionally close a connection early.
+# Keep each R2 multipart piece small enough that retries are cheap and reliable.
+RANGE_PART_BYTES = max(
+    MIN_MULTIPART_PART,
+    min(64 * 1024 * 1024, int(os.getenv("RANGE_PART_BYTES", str(8 * 1024 * 1024))))
+)
+WORKER_RANGE_RETRIES = max(1, min(8, int(os.getenv("WORKER_RANGE_RETRIES", "4"))))
+WORKER_RANGE_RETRY_BACKOFF_SECONDS = max(
+    0.25,
+    min(10.0, float(os.getenv("WORKER_RANGE_RETRY_BACKOFF_SECONDS", "1.0")))
+)
+
 MAX_ACTIVE_JOBS = max(1, min(16, int(os.getenv("MAX_ACTIVE_JOBS", "2"))))
 _job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
 YTDLP_FRAGMENT_CONCURRENCY = max(
@@ -939,6 +952,23 @@ def split_ranges(size, count):
     return result
 
 
+def split_ranges_by_chunk(size, chunk_bytes=RANGE_PART_BYTES):
+    """Create R2-compatible byte ranges with small retry-friendly pieces."""
+    size = int(size)
+    chunk_bytes = max(MIN_MULTIPART_PART, int(chunk_bytes))
+    result = []
+    start = 0
+    part_number = 1
+    while start < size:
+        end = min(size - 1, start + chunk_bytes - 1)
+        result.append((part_number, start, end))
+        start = end + 1
+        part_number += 1
+    if len(result) > 10000:
+        raise RuntimeError("Too many multipart ranges")
+    return result
+
+
 class JobCreate(BaseModel):
     user_id: int
     chat_id: int
@@ -978,41 +1008,112 @@ class ProbeRequest(BaseModel):
 
 
 def worker_download_range(body: WorkerRange):
-    headers = {
-        "Range": f"bytes={body.start}-{body.end}",
-        "User-Agent": "FattleDownloader/1.0",
-        "Accept-Encoding": "identity",
-    }
-    headers.update(body.source_headers or {})
-    response, _ = safe_request("GET", body.source_url, headers=headers, stream=True)
-    try:
-        if response.status_code != 206:
-            raise RuntimeError(f"Range download expected HTTP 206 but received {response.status_code}")
-        expected = body.end - body.start + 1
-        with tempfile.NamedTemporaryFile(prefix=f"{body.job_id}-p{body.part_number}-", delete=True) as tmp:
-            received = 0
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                tmp.write(chunk)
-                received += len(chunk)
-                if received > expected:
-                    raise RuntimeError("Origin returned more bytes than requested")
-            if received != expected:
-                raise RuntimeError(f"Incomplete range: expected {expected}, got {received}")
-            tmp.flush()
-            tmp.seek(0)
-            result = s3().upload_part(
-                Bucket=STORAGE_BUCKET,
-                Key=body.storage_key,
-                UploadId=body.upload_id,
-                PartNumber=body.part_number,
-                Body=tmp,
-                ContentLength=expected,
+    expected = body.end - body.start + 1
+    last_error = None
+
+    for attempt in range(1, WORKER_RANGE_RETRIES + 1):
+        response = None
+        try:
+            headers = {
+                "Range": f"bytes={body.start}-{body.end}",
+                "User-Agent": "FattleDownloader/3.2",
+                "Accept-Encoding": "identity",
+                "Connection": "close",
+            }
+            headers.update(body.source_headers or {})
+
+            response, _ = safe_request(
+                "GET",
+                body.source_url,
+                headers=headers,
+                stream=True,
             )
-        return {"PartNumber": body.part_number, "ETag": result["ETag"], "bytes": expected}
-    finally:
-        response.close()
+
+            if response.status_code != 206:
+                # If the origin stopped honoring Range, retrying the same request
+                # will not help. Let the coordinator use its safer fallback.
+                raise RuntimeError(
+                    f"Range download expected HTTP 206 but received {response.status_code}"
+                )
+
+            content_range = str(response.headers.get("Content-Range") or "")
+            if content_range and not content_range.lower().startswith(
+                f"bytes {body.start}-{body.end}/".lower()
+            ):
+                raise RuntimeError(
+                    f"Origin returned unexpected Content-Range: {content_range[:200]}"
+                )
+
+            with tempfile.NamedTemporaryFile(
+                prefix=f"{body.job_id}-p{body.part_number}-",
+                delete=True,
+            ) as tmp:
+                received = 0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    tmp.write(chunk)
+                    received += len(chunk)
+                    if received > expected:
+                        raise RuntimeError("Origin returned more bytes than requested")
+
+                if received != expected:
+                    raise RuntimeError(
+                        f"Incomplete range: expected {expected}, got {received}"
+                    )
+
+                tmp.flush()
+                tmp.seek(0)
+
+                result = s3().upload_part(
+                    Bucket=STORAGE_BUCKET,
+                    Key=body.storage_key,
+                    UploadId=body.upload_id,
+                    PartNumber=body.part_number,
+                    Body=tmp,
+                    ContentLength=expected,
+                )
+
+            return {
+                "PartNumber": body.part_number,
+                "ETag": result["ETag"],
+                "bytes": expected,
+                "attempts": attempt,
+            }
+
+        except Exception as exc:
+            last_error = exc
+
+            # HTTP status/content-range errors are normally deterministic.
+            deterministic = isinstance(exc, RuntimeError) and (
+                "expected HTTP 206" in str(exc)
+                or "unexpected Content-Range" in str(exc)
+                or "more bytes than requested" in str(exc)
+            )
+            if deterministic or attempt >= WORKER_RANGE_RETRIES:
+                raise RuntimeError(
+                    f"Range {body.part_number} failed after {attempt} attempt(s): {exc}"
+                ) from exc
+
+            delay = WORKER_RANGE_RETRY_BACKOFF_SECONDS * attempt
+            log.warning(
+                "Range part %s interrupted on attempt %s/%s (%s). Retrying in %.1fs",
+                body.part_number,
+                attempt,
+                WORKER_RANGE_RETRIES,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    raise RuntimeError(f"Range download failed: {last_error}")
 
 
 
@@ -1432,48 +1533,109 @@ def run_resolved_direct_job(
     key = f"jobs/{job_id}/{filename}"
 
     # Use the fast multi-worker path only when the origin provided an exact
-    # size and actually supports byte ranges. Otherwise stream once into R2.
+    # size and actually supports byte ranges. Each request is intentionally
+    # small so a transient CDN disconnect only retries a small piece.
     if probe.get("size") and probe.get("range"):
-        count = choose_part_count(probe["size"], True)
-        upload = client.create_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, ContentType=probe["content_type"])
-        upload_id = upload["UploadId"]
-        set_job(job_id, status="downloading", storage_key=key, worker_count=count, progress=5)
-        try:
-            ranges = split_ranges(probe["size"], count)
-            workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:count]
-            if len(workers) < count or any(not x for x in workers):
-                raise RuntimeError("Not enough worker URLs are configured")
-            payloads = []
-            for (part_number, start, end), worker in zip(ranges, workers):
-                payloads.append((worker, {
-                    "job_id": job_id,
-                    "source_url": probe["url"],
-                    "storage_key": key,
-                    "upload_id": upload_id,
-                    "part_number": part_number,
-                    "start": start,
-                    "end": end,
-                    "source_headers": effective_headers,
-                }))
-            parts = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
-                futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
-                for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                    parts.append(fut.result())
-                    set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
-            parts.sort(key=lambda x: x["PartNumber"])
-            client.complete_multipart_upload(
+        worker_count = choose_part_count(probe["size"], True)
+        workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:worker_count]
+        if len(workers) < worker_count or any(not x for x in workers):
+            raise RuntimeError("Not enough worker URLs are configured")
+
+        ranges = split_ranges_by_chunk(probe["size"], RANGE_PART_BYTES)
+
+        def _download_ranges(active_workers, *, fallback_mode=False):
+            upload = client.create_multipart_upload(
                 Bucket=STORAGE_BUCKET,
                 Key=key,
-                UploadId=upload_id,
-                MultipartUpload={"Parts": [{"PartNumber": p["PartNumber"], "ETag": p["ETag"]} for p in parts]},
+                ContentType=probe["content_type"],
             )
-        except Exception:
+            upload_id = upload["UploadId"]
+            concurrency = min(len(active_workers), MAX_WORKERS_PER_JOB)
+            set_job(
+                job_id,
+                status="downloading",
+                storage_key=key,
+                worker_count=concurrency,
+                range_parts=len(ranges),
+                range_part_bytes=RANGE_PART_BYTES,
+                range_fallback=fallback_mode,
+                progress=5,
+            )
+
             try:
-                client.abort_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, UploadId=upload_id)
+                payloads = []
+                for index, (part_number, start, end) in enumerate(ranges):
+                    worker = active_workers[index % len(active_workers)]
+                    payloads.append((worker, {
+                        "job_id": job_id,
+                        "source_url": probe["url"],
+                        "storage_key": key,
+                        "upload_id": upload_id,
+                        "part_number": part_number,
+                        "start": start,
+                        "end": end,
+                        "source_headers": effective_headers,
+                    }))
+
+                parts = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+                    futures = [
+                        ex.submit(call_worker, worker, "/worker/range", payload)
+                        for worker, payload in payloads
+                    ]
+                    for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                        parts.append(fut.result())
+                        set_job(
+                            job_id,
+                            progress=min(85, 5 + int(75 * idx / max(1, len(ranges)))),
+                        )
+
+                parts.sort(key=lambda x: x["PartNumber"])
+                client.complete_multipart_upload(
+                    Bucket=STORAGE_BUCKET,
+                    Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={
+                        "Parts": [
+                            {"PartNumber": p["PartNumber"], "ETag": p["ETag"]}
+                            for p in parts
+                        ]
+                    },
+                )
+                return
+
             except Exception:
-                pass
-            raise
+                try:
+                    client.abort_multipart_upload(
+                        Bucket=STORAGE_BUCKET,
+                        Key=key,
+                        UploadId=upload_id,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        try:
+            _download_ranges(workers, fallback_mode=False)
+        except Exception as first_exc:
+            # Some CDNs dislike several concurrent Range requests even though
+            # they advertise Accept-Ranges. Retry the file sequentially using
+            # the same small pieces before failing the entire job.
+            log.warning(
+                "Parallel range download failed for job %s: %s. "
+                "Retrying with one worker and small sequential ranges.",
+                job_id,
+                first_exc,
+            )
+            set_job(
+                job_id,
+                status="retrying_download",
+                progress=5,
+                range_parallel_error=str(first_exc)[:1000],
+                worker_count=1,
+            )
+            _download_ranges([workers[0]], fallback_mode=True)
+
         final_size = int(probe["size"])
     else:
         set_job(

@@ -467,3 +467,16 @@ Existing features remain:
 - private Telegram archive + copyMessage;
 - MP4/M4V delivered as Telegram video media with inline player;
 - MongoDB progress/status.
+
+
+# v3.2 — resilient range retry
+
+The direct/provider range downloader now uses small R2 multipart pieces
+(default 8 MiB) instead of one very large range per Render worker.
+
+Each range retries automatically up to `WORKER_RANGE_RETRIES` times.
+
+If the 4-worker parallel path still fails, the coordinator aborts that
+multipart upload and retries the same small ranges sequentially with one
+worker. This is useful for CDNs that advertise byte ranges but close concurrent
+connections early.
