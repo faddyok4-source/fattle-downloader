@@ -276,3 +276,19 @@ an origin site.
 This integration is for public or authorized URLs. It does not add account
 cookies or bypass private content, DRM, paywalls, login checks, site
 verification, or rate limits.
+
+
+## v1.8 — Cobalt tunnel / unknown-size streaming fix
+
+Cobalt `tunnel` responses do not always provide an exact `Content-Length`.
+Fattle now accepts `Estimated-Content-Length` when present and falls back to a
+single bounded-memory stream into R2 when an exact size or HTTP Range support
+is unavailable. Exact range-capable files still use up to four workers.
+
+This also fixes known-size files whose origin does not support Range: they now
+use the same one-stream R2 path instead of incorrectly sending a Range worker.
+The actual byte count is measured during the stream and `MAX_FILE_BYTES` is
+still enforced.
+
+Cobalt 4xx responses now preserve the provider's structured error code in the
+job error instead of only showing `Cobalt returned HTTP 400`.

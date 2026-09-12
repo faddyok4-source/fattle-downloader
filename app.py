@@ -87,6 +87,10 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", "1900000000"))
 MAX_REDIRECTS = max(1, min(10, int(os.getenv("MAX_REDIRECTS", "5"))))
 DOWNLOAD_TIMEOUT = max(30, min(3600, int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "900"))))
 MIN_MULTIPART_PART = 5 * 1024 * 1024
+R2_STREAM_PART_BYTES = max(
+    MIN_MULTIPART_PART,
+    min(64 * 1024 * 1024, int(os.getenv("R2_STREAM_PART_BYTES", str(8 * 1024 * 1024))))
+)
 MAX_WORKERS_PER_JOB = 4
 MAX_ACTIVE_JOBS = max(1, min(16, int(os.getenv("MAX_ACTIVE_JOBS", "2"))))
 _job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -133,7 +137,7 @@ TERABOX_HINTS = (
     "terafileshare", "terasharefile", "terasharelink",
 )
 
-app = FastAPI(title="Fattle Downloader", version="1.7-multi-provider")
+app = FastAPI(title="Fattle Downloader", version="1.8-cobalt-stream-fallback")
 
 mongo = None
 jobs = None
@@ -222,6 +226,7 @@ def _status_message_text(doc):
     progress = int(doc.get("progress") or 0)
     filename = str(doc.get("filename") or "Preparing…")
     size = int(doc.get("size") or 0)
+    downloaded_bytes = int(doc.get("downloaded_bytes") or 0)
     quality = str(doc.get("requested_quality") or "best")
     workers = int(doc.get("worker_count") or 0)
     fragments = int(doc.get("fragment_workers") or 0)
@@ -229,6 +234,8 @@ def _status_message_text(doc):
         size_text = f"{size / (1024**3):.2f} GB"
     elif size:
         size_text = f"{size / (1024**2):.1f} MB"
+    elif downloaded_bytes:
+        size_text = f"{downloaded_bytes / (1024**2):.1f} MB downloaded"
     else:
         size_text = "—"
     worker_text = str(workers or "—")
@@ -797,8 +804,26 @@ def parse_filename(response, final_url):
     return (name or "download.bin")[:180]
 
 
-def probe_direct(url, extra_headers=None):
-    request_headers = {"Range": "bytes=0-0", "User-Agent": "FattleDownloader/1.0"}
+def _header_int(headers, *names):
+    for name in names:
+        value = str(headers.get(name) or "").strip()
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def probe_direct(url, extra_headers=None, allow_unknown_size=False):
+    """Probe a direct/resolved URL without consuming the full body.
+
+    Normal direct files still require an exact size by default. Provider
+    tunnels can opt into ``allow_unknown_size`` because streaming APIs such as
+    Cobalt may omit Content-Length and expose Estimated-Content-Length instead.
+    """
+    request_headers = {
+        "Range": "bytes=0-0",
+        "User-Agent": "FattleDownloader/1.0",
+        "Accept-Encoding": "identity",
+    }
     request_headers.update(extra_headers or {})
     r, final_url = safe_request("GET", url, headers=request_headers, stream=True)
     try:
@@ -813,15 +838,22 @@ def probe_direct(url, extra_headers=None):
                 total = int(m.group(1))
                 ranges = True
         elif r.status_code == 200:
-            cl = r.headers.get("Content-Length")
-            total = int(cl) if cl and cl.isdigit() else None
+            total = _header_int(r.headers, "Content-Length")
             ranges = "bytes" in (r.headers.get("Accept-Ranges") or "").lower()
         else:
             raise ValueError(f"Source returned HTTP {r.status_code}")
-        if not total:
-            raise ValueError("The source did not provide a reliable file size")
-        if total > MAX_FILE_BYTES:
+
+        estimated = _header_int(
+            r.headers,
+            "Estimated-Content-Length",
+            "X-Estimated-Content-Length",
+        )
+        if total and total > MAX_FILE_BYTES:
             raise ValueError(f"File is too large ({total} bytes). Limit is {MAX_FILE_BYTES} bytes")
+        if estimated and estimated > MAX_FILE_BYTES:
+            raise ValueError(f"Estimated file size is too large ({estimated} bytes). Limit is {MAX_FILE_BYTES} bytes")
+        if not total and not allow_unknown_size:
+            raise ValueError("The source did not provide a reliable file size")
         if content_type.startswith("text/html"):
             if source_kind(url) == "terabox":
                 raise ValueError(
@@ -829,7 +861,14 @@ def probe_direct(url, extra_headers=None):
                     "This build does not bypass TeraBox login/share restrictions."
                 )
             raise ValueError("MEDIA_PAGE: source is a webpage, not a direct file")
-        return {"url": final_url, "size": total, "range": ranges, "filename": filename, "content_type": content_type}
+        return {
+            "url": final_url,
+            "size": total,
+            "estimated_size": estimated,
+            "range": bool(ranges and total),
+            "filename": filename,
+            "content_type": content_type,
+        }
     finally:
         r.close()
 
@@ -924,6 +963,110 @@ def worker_download_range(body: WorkerRange):
                 ContentLength=expected,
             )
         return {"PartNumber": body.part_number, "ETag": result["ETag"], "bytes": expected}
+    finally:
+        response.close()
+
+
+
+def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
+    """Stream a non-range/unknown-size source into R2 using multipart upload.
+
+    No whole file is written to local disk. The actual byte count is measured
+    while streaming and MAX_FILE_BYTES is enforced even when the origin did not
+    provide Content-Length.
+    """
+    headers = {
+        "User-Agent": "FattleDownloader/1.0",
+        "Accept-Encoding": "identity",
+    }
+    headers.update(source_headers or {})
+    response, final_url = safe_request("GET", source_url, headers=headers, stream=True)
+    client = s3()
+    upload_id = None
+    received = 0
+    last_reported = -1
+    parts = []
+    part_number = 1
+    buffer = bytearray()
+    try:
+        if response.status_code not in {200, 206}:
+            raise RuntimeError(f"Stream download returned HTTP {response.status_code}")
+
+        response_size = _header_int(response.headers, "Content-Length")
+        response_estimate = _header_int(
+            response.headers,
+            "Estimated-Content-Length",
+            "X-Estimated-Content-Length",
+        )
+        expected = response_size or response_estimate or estimated_size
+        if expected and expected > MAX_FILE_BYTES:
+            raise RuntimeError(f"File is too large ({expected} bytes). Limit is {MAX_FILE_BYTES} bytes")
+
+        upload = client.create_multipart_upload(
+            Bucket=STORAGE_BUCKET,
+            Key=storage_key,
+            ContentType=content_type or "application/octet-stream",
+        )
+        upload_id = upload["UploadId"]
+
+        def flush_part(payload):
+            nonlocal part_number
+            result = client.upload_part(
+                Bucket=STORAGE_BUCKET,
+                Key=storage_key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=bytes(payload),
+                ContentLength=len(payload),
+            )
+            parts.append({"PartNumber": part_number, "ETag": result["ETag"]})
+            part_number += 1
+
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            received += len(chunk)
+            if received > MAX_FILE_BYTES:
+                raise RuntimeError(f"File exceeded the configured limit of {MAX_FILE_BYTES} bytes")
+            buffer.extend(chunk)
+            while len(buffer) >= R2_STREAM_PART_BYTES:
+                payload = buffer[:R2_STREAM_PART_BYTES]
+                del buffer[:R2_STREAM_PART_BYTES]
+                flush_part(payload)
+
+            if expected:
+                pct = min(85, 5 + int(80 * min(received, expected) / max(1, expected)))
+            else:
+                # Exact percentage is unknowable without a total. Keep the bar
+                # conservative while still exposing downloaded MB in the status.
+                pct = 10
+            report_bucket = received // (4 * 1024 * 1024)
+            if report_bucket != last_reported:
+                last_reported = report_bucket
+                set_job(job_id, progress=pct, downloaded_bytes=received)
+
+        if not received:
+            raise RuntimeError("The source returned an empty file")
+        if buffer:
+            flush_part(buffer)
+        if not parts:
+            raise RuntimeError("The stream did not produce any upload parts")
+
+        client.complete_multipart_upload(
+            Bucket=STORAGE_BUCKET,
+            Key=storage_key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+        upload_id = None
+        return {"size": received, "url": final_url}
+    except Exception:
+        if upload_id:
+            try:
+                client.abort_multipart_upload(Bucket=STORAGE_BUCKET, Key=storage_key, UploadId=upload_id)
+            except Exception:
+                pass
+        raise
     finally:
         response.close()
 
@@ -1032,7 +1175,18 @@ def cobalt_resolve(source_url, quality):
     if r.status_code in {401, 403}:
         raise ProviderError("Cobalt rejected the API credentials or request.")
     if r.status_code >= 400:
-        raise ProviderError(f"Cobalt returned HTTP {r.status_code}")
+        try:
+            error_data = r.json()
+        except Exception:
+            error_data = {}
+        err = error_data.get("error") if isinstance(error_data, dict) and isinstance(error_data.get("error"), dict) else {}
+        code = str(err.get("code") or "").strip()
+        context = err.get("context") if isinstance(err.get("context"), dict) else {}
+        service = str(context.get("service") or "").strip()
+        detail = code or f"HTTP {r.status_code}"
+        if service:
+            detail += f"; service={service}"
+        raise ProviderError(f"Cobalt could not resolve this media ({detail})")
     try:
         data = r.json()
     except Exception as exc:
@@ -1375,20 +1529,27 @@ def run_resolved_direct_job(
     requested_quality="original",
     filename_hint=None,
     provider=None,
+    allow_unknown_size=False,
 ):
-    probe = probe_direct(source_url, extra_headers=source_headers)
+    probe = probe_direct(
+        source_url,
+        extra_headers=source_headers,
+        allow_unknown_size=allow_unknown_size,
+    )
     effective_headers = dict(source_headers or {})
     if normalize_host(urlparse(probe["url"]).hostname) != normalize_host(urlparse(source_url).hostname):
         effective_headers.pop("Authorization", None)
     filename = filename_hint or probe["filename"]
     filename = re.sub(r"[^A-Za-z0-9._()\- ]+", "_", filename or probe["filename"]).strip(" .")[:180] or probe["filename"]
+    initial_size = int(probe.get("size") or 0)
     set_job(
         job_id,
         status="preparing",
         source_type=source_type,
         provider=provider,
         filename=filename,
-        size=probe["size"],
+        size=initial_size,
+        estimated_size=int(probe.get("estimated_size") or 0),
         content_type=probe["content_type"],
         progress=2,
         requested_quality=requested_quality,
@@ -1396,49 +1557,73 @@ def run_resolved_direct_job(
     )
     client = s3()
     key = f"jobs/{job_id}/{filename}"
-    count = choose_part_count(probe["size"], probe["range"])
-    upload = client.create_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, ContentType=probe["content_type"])
-    upload_id = upload["UploadId"]
-    set_job(job_id, status="downloading", storage_key=key, worker_count=count, progress=5)
-    try:
-        ranges = split_ranges(probe["size"], count)
-        workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:count]
-        if len(workers) < count or any(not x for x in workers):
-            raise RuntimeError("Not enough worker URLs are configured")
-        payloads = []
-        for (part_number, start, end), worker in zip(ranges, workers):
-            payloads.append((worker, {
-                "job_id": job_id,
-                "source_url": probe["url"],
-                "storage_key": key,
-                "upload_id": upload_id,
-                "part_number": part_number,
-                "start": start,
-                "end": end,
-                "source_headers": effective_headers,
-            }))
-        parts = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
-            futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
-            for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                parts.append(fut.result())
-                set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
-        parts.sort(key=lambda x: x["PartNumber"])
-        client.complete_multipart_upload(
-            Bucket=STORAGE_BUCKET,
-            Key=key,
-            UploadId=upload_id,
-            MultipartUpload={"Parts": [{"PartNumber": p["PartNumber"], "ETag": p["ETag"]} for p in parts]},
-        )
-    except Exception:
-        try:
-            client.abort_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, UploadId=upload_id)
-        except Exception:
-            pass
-        raise
 
-    set_job(job_id, status="stored", progress=92, storage_key=key)
-    if maybe_deliver(job_id, request.chat_id, key, filename, probe["content_type"], probe["size"]):
+    # Use the fast multi-worker path only when the origin provided an exact
+    # size and actually supports byte ranges. Otherwise stream once into R2.
+    if probe.get("size") and probe.get("range"):
+        count = choose_part_count(probe["size"], True)
+        upload = client.create_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, ContentType=probe["content_type"])
+        upload_id = upload["UploadId"]
+        set_job(job_id, status="downloading", storage_key=key, worker_count=count, progress=5)
+        try:
+            ranges = split_ranges(probe["size"], count)
+            workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:count]
+            if len(workers) < count or any(not x for x in workers):
+                raise RuntimeError("Not enough worker URLs are configured")
+            payloads = []
+            for (part_number, start, end), worker in zip(ranges, workers):
+                payloads.append((worker, {
+                    "job_id": job_id,
+                    "source_url": probe["url"],
+                    "storage_key": key,
+                    "upload_id": upload_id,
+                    "part_number": part_number,
+                    "start": start,
+                    "end": end,
+                    "source_headers": effective_headers,
+                }))
+            parts = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
+                futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
+                for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                    parts.append(fut.result())
+                    set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
+            parts.sort(key=lambda x: x["PartNumber"])
+            client.complete_multipart_upload(
+                Bucket=STORAGE_BUCKET,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": [{"PartNumber": p["PartNumber"], "ETag": p["ETag"]} for p in parts]},
+            )
+        except Exception:
+            try:
+                client.abort_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, UploadId=upload_id)
+            except Exception:
+                pass
+            raise
+        final_size = int(probe["size"])
+    else:
+        set_job(
+            job_id,
+            status="downloading",
+            storage_key=key,
+            worker_count=1,
+            progress=5,
+            downloaded_bytes=0,
+        )
+        streamed = stream_source_to_r2(
+            job_id,
+            probe["url"],
+            effective_headers,
+            key,
+            probe["content_type"],
+            estimated_size=probe.get("estimated_size") or probe.get("size"),
+        )
+        final_size = int(streamed["size"])
+        set_job(job_id, size=final_size, downloaded_bytes=final_size, progress=85)
+
+    set_job(job_id, status="stored", progress=92, storage_key=key, size=final_size)
+    if maybe_deliver(job_id, request.chat_id, key, filename, probe["content_type"], final_size):
         set_job(job_id, status="complete", progress=100, completed_at=now())
         maybe_push_status(job_id, force=True)
 
@@ -1475,6 +1660,7 @@ def run_cobalt_job(job_id, request: JobCreate):
         requested_quality=media_quality,
         filename_hint=resolved.get("filename"),
         provider="cobalt",
+        allow_unknown_size=True,
     )
 
 
@@ -1499,6 +1685,7 @@ def run_terabox_provider_job(job_id, request: JobCreate):
         requested_quality="original",
         filename_hint=resolved.get("filename"),
         provider="terabox",
+        allow_unknown_size=True,
     )
 
 
