@@ -17,7 +17,6 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from worker_pool import WorkerPool
 from urllib.parse import unquote, urljoin, urlparse
 
 import boto3
@@ -53,8 +52,7 @@ WORKER_URLS = [
     os.getenv("WORKER_3", "").strip().rstrip("/"),
     os.getenv("WORKER_4", "").strip().rstrip("/"),
 ]
-WORKER_URLS = list(dict.fromkeys(x for x in WORKER_URLS if x))
-_worker_pool = WorkerPool(WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])
+WORKER_URLS = [x for x in WORKER_URLS if x]
 
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "fattle_downloader").strip()
@@ -97,6 +95,16 @@ YTDLP_FRAGMENT_CONCURRENCY = max(
 )
 YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 
+# Optional resolver providers. These are coordinator-side only; workers never
+# need the provider secrets. Cobalt is intended for public/authorized media
+# URLs. TeraBox Gateway is used only for public share links.
+COBALT_API_URL = os.getenv("COBALT_API_URL", "").strip().rstrip("/")
+COBALT_API_KEY = os.getenv("COBALT_API_KEY", "").strip()
+TERABOX_API_URL = os.getenv("TERABOX_API_URL", "").strip().rstrip("/")
+PROVIDER_TIMEOUT_SECONDS = max(5, min(120, int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "30"))))
+PROVIDER_RETRIES = max(0, min(3, int(os.getenv("PROVIDER_RETRIES", "2"))))
+PROVIDER_FALLBACK_YTDLP = os.getenv("PROVIDER_FALLBACK_YTDLP", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # Deno is installed into the project by build.sh. yt-dlp uses it for
 # JavaScript challenge handling where supported (especially YouTube).
 DENO_BIN = os.getenv(
@@ -120,9 +128,12 @@ MEDIA_HOST_SUFFIXES = (
     "vimeo.com",
     "soundcloud.com",
 )
-TERABOX_HINTS = ("terabox", "1024tera", "nephobox", "4funbox", "mirrobox")
+TERABOX_HINTS = (
+    "terabox", "1024tera", "nephobox", "4funbox", "mirrobox",
+    "terafileshare", "terasharefile", "terasharelink",
+)
 
-app = FastAPI(title="Fattle Downloader", version="1.6-youtube-deno-multimedia")
+app = FastAPI(title="Fattle Downloader", version="1.7-multi-provider")
 
 mongo = None
 jobs = None
@@ -730,12 +741,19 @@ def validate_public_url(url):
 
 def safe_request(method, url, *, headers=None, stream=False, timeout=None):
     current = url
+    base_host = normalize_host(urlparse(url).hostname)
+    request_headers = dict(headers or {})
     for _ in range(MAX_REDIRECTS + 1):
         validate_public_url(current)
+        current_headers = dict(request_headers)
+        if normalize_host(urlparse(current).hostname) != base_host:
+            # Provider API keys are valid only for the provider origin. Never
+            # forward Authorization to an origin reached by redirect.
+            current_headers.pop("Authorization", None)
         r = requests.request(
             method,
             current,
-            headers=headers or {},
+            headers=current_headers,
             stream=stream,
             timeout=timeout or (15, DOWNLOAD_TIMEOUT),
             allow_redirects=False,
@@ -779,8 +797,10 @@ def parse_filename(response, final_url):
     return (name or "download.bin")[:180]
 
 
-def probe_direct(url):
-    r, final_url = safe_request("GET", url, headers={"Range": "bytes=0-0", "User-Agent": "FattleDownloader/1.0"}, stream=True)
+def probe_direct(url, extra_headers=None):
+    request_headers = {"Range": "bytes=0-0", "User-Agent": "FattleDownloader/1.0"}
+    request_headers.update(extra_headers or {})
+    r, final_url = safe_request("GET", url, headers=request_headers, stream=True)
     try:
         content_type = (r.headers.get("Content-Type") or "application/octet-stream").split(";", 1)[0].strip()
         filename = parse_filename(r, final_url)
@@ -848,6 +868,7 @@ class WorkerRange(BaseModel):
     part_number: int
     start: int
     end: int
+    source_headers: dict[str, str] | None = None
 
 
 class WorkerMedia(BaseModel):
@@ -875,6 +896,7 @@ def worker_download_range(body: WorkerRange):
         "User-Agent": "FattleDownloader/1.0",
         "Accept-Encoding": "identity",
     }
+    headers.update(body.source_headers or {})
     response, _ = safe_request("GET", body.source_url, headers=headers, stream=True)
     try:
         if response.status_code != 206:
@@ -932,6 +954,172 @@ def ytdlp_js_runtime_options():
         return {}
     return {"deno": {"path": deno}}
 
+
+
+class ProviderError(RuntimeError):
+    pass
+
+
+def _provider_request(method, url, *, headers=None, json_body=None, params=None):
+    """Small retry wrapper for provider APIs.
+
+    Only network errors and 5xx responses are retried. 4xx responses (notably
+    401/403/429) are returned immediately so Fattle does not hammer a provider
+    that is rejecting or rate-limiting the request.
+    """
+    last_error = None
+    attempts = PROVIDER_RETRIES + 1
+    for attempt in range(attempts):
+        try:
+            r = requests.request(
+                method,
+                url,
+                headers=headers or {},
+                json=json_body,
+                params=params,
+                timeout=(10, PROVIDER_TIMEOUT_SECONDS),
+                allow_redirects=False,
+            )
+            if r.status_code < 500:
+                return r
+            last_error = ProviderError(f"Provider returned HTTP {r.status_code}")
+        except requests.RequestException as exc:
+            last_error = ProviderError(f"Provider request failed: {exc}")
+        if attempt + 1 < attempts:
+            time.sleep(min(2 ** attempt, 3))
+    raise last_error or ProviderError("Provider request failed")
+
+
+def _cobalt_headers():
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "FattleDownloader/1.7",
+    }
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    return headers
+
+
+def _cobalt_quality(quality):
+    q = str(quality or "best").strip().lower()
+    if q in {"audio", "audio only", "mp3", "m4a"}:
+        return "max", "audio"
+    if q in {"best", "max", "highest", "original"}:
+        return "max", "auto"
+    m = re.search(r"(144|240|360|480|720|1080|1440|2160|4320)", q)
+    return (m.group(1) if m else "1080"), "auto"
+
+
+def cobalt_resolve(source_url, quality):
+    if not COBALT_API_URL:
+        raise ProviderError("Cobalt provider is not configured")
+    video_quality, download_mode = _cobalt_quality(quality)
+    payload = {
+        "url": source_url,
+        "videoQuality": video_quality,
+        "downloadMode": download_mode,
+        "audioFormat": "best",
+        "filenameStyle": "basic",
+        "youtubeVideoContainer": "mp4",
+        "localProcessing": "disabled",
+    }
+    r = _provider_request(
+        "POST", COBALT_API_URL + "/", headers=_cobalt_headers(), json_body=payload
+    )
+    if r.status_code == 429:
+        raise ProviderError("Cobalt is rate-limiting requests. Please try again later.")
+    if r.status_code in {401, 403}:
+        raise ProviderError("Cobalt rejected the API credentials or request.")
+    if r.status_code >= 400:
+        raise ProviderError(f"Cobalt returned HTTP {r.status_code}")
+    try:
+        data = r.json()
+    except Exception as exc:
+        raise ProviderError("Cobalt returned an invalid response") from exc
+
+    status = str(data.get("status") or "").lower()
+    if status in {"redirect", "tunnel"}:
+        direct = str(data.get("url") or "").strip()
+        if not direct:
+            raise ProviderError("Cobalt did not return a download URL")
+        validate_public_url(direct)
+        source_headers = {}
+        if normalize_host(urlparse(direct).hostname) == normalize_host(urlparse(COBALT_API_URL).hostname):
+            source_headers = _cobalt_headers()
+            source_headers.pop("Content-Type", None)
+            source_headers.pop("Accept", None)
+        return {
+            "url": direct,
+            "filename": str(data.get("filename") or "").strip() or None,
+            "headers": source_headers,
+            "provider": "cobalt",
+            "provider_status": status,
+        }
+
+    if status == "picker":
+        want_audio = _cobalt_quality(quality)[1] == "audio"
+        if want_audio and data.get("audio"):
+            direct = str(data.get("audio") or "").strip()
+            filename = str(data.get("audioFilename") or "audio.m4a")
+        else:
+            items = data.get("picker") if isinstance(data.get("picker"), list) else []
+            item = next((x for x in items if isinstance(x, dict) and x.get("type") in {"video", "gif"}), None)
+            if item is None:
+                raise ProviderError("This post contains multiple images/items; multi-item Cobalt picker downloads are not supported yet")
+            direct = str(item.get("url") or "").strip()
+            filename = None
+        validate_public_url(direct)
+        return {"url": direct, "filename": filename, "headers": {}, "provider": "cobalt", "provider_status": status}
+
+    if status == "local-processing":
+        raise ProviderError("Cobalt requires local media processing for this result")
+
+    if status == "error":
+        err = data.get("error") if isinstance(data.get("error"), dict) else {}
+        code = str(err.get("code") or "unknown")
+        raise ProviderError(f"Cobalt could not resolve this media ({code})")
+
+    raise ProviderError(f"Unsupported Cobalt response: {status or 'unknown'}")
+
+
+def terabox_resolve(source_url):
+    if not TERABOX_API_URL:
+        raise ProviderError("TeraBox provider is not configured")
+    r = _provider_request(
+        "GET",
+        TERABOX_API_URL + "/api",
+        headers={"Accept": "application/json", "User-Agent": "FattleDownloader/1.7"},
+        params={"url": source_url, "resolve": "true"},
+    )
+    if r.status_code == 429:
+        raise ProviderError("TeraBox resolver is rate-limiting requests. Please try again later.")
+    if r.status_code >= 400:
+        raise ProviderError(f"TeraBox resolver returned HTTP {r.status_code}")
+    try:
+        data = r.json()
+    except Exception as exc:
+        raise ProviderError("TeraBox resolver returned an invalid response") from exc
+    if str(data.get("status") or "").lower() != "success":
+        raise ProviderError(str(data.get("message") or "TeraBox resolver could not resolve this share"))
+    files = data.get("files") if isinstance(data.get("files"), list) else []
+    downloadable = [x for x in files if isinstance(x, dict) and x.get("download_link")]
+    if not downloadable:
+        raise ProviderError("TeraBox share contains no downloadable file")
+    if len(downloadable) != 1:
+        raise ProviderError("TeraBox folders/multi-file shares are not supported yet; send a single-file share")
+    item = downloadable[0]
+    direct = str(item.get("download_link") or "").strip()
+    validate_public_url(direct)
+    raw_size = item.get("size")
+    size = int(raw_size) if isinstance(raw_size, (int, float)) or (isinstance(raw_size, str) and raw_size.isdigit()) else None
+    return {
+        "url": direct,
+        "filename": str(item.get("filename") or "").strip() or None,
+        "size": size,
+        "headers": {},
+        "provider": "terabox",
+    }
 
 def ytdlp_format(quality):
     """Prefer the requested quality, but always keep a general fallback.
@@ -1177,44 +1365,64 @@ def maybe_deliver(job_id, chat_id, key, filename, content_type, size):
         return False
 
 
-def run_direct_job(job_id, request: JobCreate):
-    probe = probe_direct(request.url)
+def run_resolved_direct_job(
+    job_id,
+    request: JobCreate,
+    source_url,
+    *,
+    source_headers=None,
+    source_type="direct",
+    requested_quality="original",
+    filename_hint=None,
+    provider=None,
+):
+    probe = probe_direct(source_url, extra_headers=source_headers)
+    effective_headers = dict(source_headers or {})
+    if normalize_host(urlparse(probe["url"]).hostname) != normalize_host(urlparse(source_url).hostname):
+        effective_headers.pop("Authorization", None)
+    filename = filename_hint or probe["filename"]
+    filename = re.sub(r"[^A-Za-z0-9._()\- ]+", "_", filename or probe["filename"]).strip(" .")[:180] or probe["filename"]
     set_job(
-        job_id, status="preparing", source_type="direct", filename=probe["filename"],
-        size=probe["size"], content_type=probe["content_type"], progress=2,
-        requested_quality="original",
+        job_id,
+        status="preparing",
+        source_type=source_type,
+        provider=provider,
+        filename=filename,
+        size=probe["size"],
+        content_type=probe["content_type"],
+        progress=2,
+        requested_quality=requested_quality,
+        fragment_workers=0,
     )
     client = s3()
-    key = f"jobs/{job_id}/{probe['filename']}"
+    key = f"jobs/{job_id}/{filename}"
     count = choose_part_count(probe["size"], probe["range"])
-
-    if count == 1:
-        # One worker still uses multipart with one part. S3 permits a final part below 5 MB.
-        count = 1
     upload = client.create_multipart_upload(Bucket=STORAGE_BUCKET, Key=key, ContentType=probe["content_type"])
     upload_id = upload["UploadId"]
     set_job(job_id, status="downloading", storage_key=key, worker_count=count, progress=5)
     try:
         ranges = split_ranges(probe["size"], count)
-        # Reserve distinct workers atomically; share load tracking with media jobs.
-        with _worker_pool.reserve(count) as workers:
-            payloads = []
-            for (part_number, start, end), worker in zip(ranges, workers):
-                payloads.append((worker, {
-                    "job_id": job_id,
-                    "source_url": probe["url"],
-                    "storage_key": key,
-                    "upload_id": upload_id,
-                    "part_number": part_number,
-                    "start": start,
-                    "end": end,
-                }))
-            parts = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
-                futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
-                for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                    parts.append(fut.result())
-                    set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
+        workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:count]
+        if len(workers) < count or any(not x for x in workers):
+            raise RuntimeError("Not enough worker URLs are configured")
+        payloads = []
+        for (part_number, start, end), worker in zip(ranges, workers):
+            payloads.append((worker, {
+                "job_id": job_id,
+                "source_url": probe["url"],
+                "storage_key": key,
+                "upload_id": upload_id,
+                "part_number": part_number,
+                "start": start,
+                "end": end,
+                "source_headers": effective_headers,
+            }))
+        parts = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
+            futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
+            for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                parts.append(fut.result())
+                set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
         parts.sort(key=lambda x: x["PartNumber"])
         client.complete_multipart_upload(
             Bucket=STORAGE_BUCKET,
@@ -1230,32 +1438,85 @@ def run_direct_job(job_id, request: JobCreate):
         raise
 
     set_job(job_id, status="stored", progress=92, storage_key=key)
-    if maybe_deliver(job_id, request.chat_id, key, probe["filename"], probe["content_type"], probe["size"]):
+    if maybe_deliver(job_id, request.chat_id, key, filename, probe["content_type"], probe["size"]):
         set_job(job_id, status="complete", progress=100, completed_at=now())
         maybe_push_status(job_id, force=True)
 
 
-def run_media_job(job_id, request: JobCreate):
+def run_direct_job(job_id, request: JobCreate):
+    return run_resolved_direct_job(
+        job_id,
+        request,
+        request.url,
+        source_type="direct",
+        requested_quality="original",
+    )
+
+
+def run_cobalt_job(job_id, request: JobCreate):
+    media_quality = "best" if str(request.quality or "").lower() == "original" else request.quality
+    set_job(
+        job_id,
+        status="resolving_provider",
+        source_type="media",
+        provider="cobalt",
+        progress=3,
+        requested_quality=media_quality,
+        worker_count=0,
+        fragment_workers=0,
+    )
+    resolved = cobalt_resolve(request.url, media_quality)
+    return run_resolved_direct_job(
+        job_id,
+        request,
+        resolved["url"],
+        source_headers=resolved.get("headers") or {},
+        source_type="cobalt",
+        requested_quality=media_quality,
+        filename_hint=resolved.get("filename"),
+        provider="cobalt",
+    )
+
+
+def run_terabox_provider_job(job_id, request: JobCreate):
+    set_job(
+        job_id,
+        status="resolving_provider",
+        source_type="terabox",
+        provider="terabox",
+        progress=3,
+        requested_quality="original",
+        worker_count=0,
+        fragment_workers=0,
+    )
+    resolved = terabox_resolve(request.url)
+    return run_resolved_direct_job(
+        job_id,
+        request,
+        resolved["url"],
+        source_headers=resolved.get("headers") or {},
+        source_type="terabox",
+        requested_quality="original",
+        filename_hint=resolved.get("filename"),
+        provider="terabox",
+    )
+
+
+def run_ytdlp_media_job(job_id, request: JobCreate):
     if not WORKER_URLS:
         raise RuntimeError("At least one worker URL is required for media extraction")
     media_quality = "best" if str(request.quality or "").lower() == "original" else request.quality
     set_job(
-        job_id, status="downloading", source_type="media", progress=5,
+        job_id, status="downloading", source_type="media", provider="yt-dlp", progress=5,
         worker_count=1, fragment_workers=YTDLP_FRAGMENT_CONCURRENCY,
         requested_quality=media_quality,
     )
-    # Spread independent media downloads across available workers.
-    # A single extractor job still runs on one worker (with local fragment concurrency).
-    with _worker_pool.reserve() as selected:
-        worker = selected[0]
-        set_job(job_id, worker_number=WORKER_URLS.index(worker) + 1)
-        result = call_worker(worker, "/worker/media", {
-            "job_id": job_id,
-            "source_url": request.url,
-            "storage_key_prefix": f"jobs/{job_id}",
-            "quality": media_quality,
-        })
-
+    result = call_worker(WORKER_URLS[0], "/worker/media", {
+        "job_id": job_id,
+        "source_url": request.url,
+        "storage_key_prefix": f"jobs/{job_id}",
+        "quality": media_quality,
+    })
     set_job(
         job_id,
         status="stored",
@@ -1275,7 +1536,21 @@ def run_media_job(job_id, request: JobCreate):
 
 # Backward-compatible function name.
 def run_youtube_job(job_id, request: JobCreate):
-    return run_media_job(job_id, request)
+    return run_ytdlp_media_job(job_id, request)
+
+
+def run_media_job(job_id, request: JobCreate):
+    """Primary media route: Cobalt first when configured, yt-dlp fallback."""
+    if COBALT_API_URL:
+        try:
+            return run_cobalt_job(job_id, request)
+        except Exception as exc:
+            log.warning("Cobalt provider failed for %s: %s", job_id, exc)
+            set_job(job_id, provider_error=str(exc)[:500])
+            if not PROVIDER_FALLBACK_YTDLP:
+                raise
+            set_job(job_id, status="provider_fallback", progress=4, provider="yt-dlp")
+    return run_ytdlp_media_job(job_id, request)
 
 
 def run_job(job_id, request: JobCreate):
@@ -1289,11 +1564,22 @@ def run_job(job_id, request: JobCreate):
         if kind == "media":
             run_media_job(job_id, request)
         elif kind == "terabox":
-            # Only public direct-file TeraBox URLs are accepted.
-            run_direct_job(job_id, request)
+            if TERABOX_API_URL:
+                try:
+                    run_terabox_provider_job(job_id, request)
+                except Exception as exc:
+                    log.warning("TeraBox provider failed for %s: %s", job_id, exc)
+                    set_job(job_id, provider_error=str(exc)[:500])
+                    # Preserve support for already-direct public TeraBox links.
+                    try:
+                        run_direct_job(job_id, request)
+                    except Exception:
+                        raise ProviderError(str(exc)) from exc
+            else:
+                run_direct_job(job_id, request)
         else:
             # Prefer the fast 4-worker direct-file path. If the URL is a normal
-            # webpage rather than a file, fall back to yt-dlp's extractor list.
+            # webpage rather than a file, route it through the media providers.
             try:
                 run_direct_job(job_id, request)
             except ValueError as exc:
@@ -1334,6 +1620,11 @@ def root():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "providers": {
+            "cobalt": bool(COBALT_API_URL),
+            "terabox": bool(TERABOX_API_URL),
+            "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
+        },
     }
 
 
@@ -1347,6 +1638,11 @@ def health():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "providers": {
+            "cobalt": bool(COBALT_API_URL),
+            "terabox": bool(TERABOX_API_URL),
+            "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
+        },
     }
 
 
@@ -1388,7 +1684,34 @@ def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(defau
 
     kind = source_kind(body.url)
     if kind == "media":
-        return {"ok": True, "kind": "media", "source_type": "media"}
+        return {
+            "ok": True,
+            "kind": "media",
+            "source_type": "media",
+            "provider": "cobalt" if COBALT_API_URL else "yt-dlp",
+        }
+
+    if kind == "terabox" and TERABOX_API_URL:
+        try:
+            resolved = terabox_resolve(body.url)
+            # Probe only the resolved public file. The direct URL itself is not
+            # returned to Vercel and will be resolved again when the job starts.
+            info = probe_direct(resolved["url"], extra_headers=resolved.get("headers") or {})
+            return {
+                "ok": True,
+                "kind": "direct",
+                "source_type": "terabox",
+                "provider": "terabox",
+                "filename": resolved.get("filename") or info.get("filename"),
+                "size": info.get("size"),
+                "content_type": info.get("content_type"),
+                "range": bool(info.get("range")),
+                "worker_count": choose_part_count(int(info.get("size") or 0), bool(info.get("range"))),
+            }
+        except ProviderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     try:
         info = probe_direct(body.url)

@@ -242,3 +242,37 @@ After deploying, `/health` should include:
   "yt_dlp_version": "2026.08.19"
 }
 ```
+
+
+## v1.7 — multi-provider resolver layer
+
+The coordinator can now use optional resolver services before falling back to
+its local yt-dlp worker:
+
+```text
+YouTube / Instagram / TikTok / supported media
+  -> Cobalt (when configured)
+  -> resolved public download/tunnel URL
+  -> Fattle direct downloader (up to 4 Range workers)
+  -> yt-dlp fallback if Cobalt cannot resolve it
+
+TeraBox public single-file share
+  -> TeraBox Gateway (when configured)
+  -> resolved public direct URL
+  -> Fattle direct downloader (up to 4 Range workers)
+
+Normal direct file
+  -> Fattle direct downloader immediately
+```
+
+Only Render #1 needs `COBALT_API_URL`, `COBALT_API_KEY`, and
+`TERABOX_API_URL`. Worker #2-#4 do not need provider credentials.
+
+The coordinator never exposes resolved provider URLs or provider keys to the
+Telegram/Vercel client. Authorization headers are stripped if a provider URL
+redirects to a different host, preventing an API key from being forwarded to
+an origin site.
+
+This integration is for public or authorized URLs. It does not add account
+cookies or bypass private content, DRM, paywalls, login checks, site
+verification, or rate limits.
