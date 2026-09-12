@@ -33,7 +33,7 @@ from yt_dlp.utils import DownloadError
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from telethon import TelegramClient, utils as telethon_utils
 from telethon.sessions import StringSession
-from providers import ProviderError, ProviderRouter, detect_platform
+from providers import ProviderError, ProviderRouter, detect_platform, ROUTER_BUILD
 
 try:
     import imageio_ffmpeg
@@ -137,7 +137,7 @@ TERABOX_HINTS = (
     "terafileshare", "terasharefile", "terasharelink",
 )
 
-app = FastAPI(title="Fattle Downloader", version="3.0-ahm7-prexzy")
+app = FastAPI(title="Fattle Downloader", version="3.1-ahm7-prexzy-probe-fix")
 
 mongo = None
 jobs = None
@@ -1684,6 +1684,7 @@ def root():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "provider_router_build": ROUTER_BUILD,
         "providers": {
             **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
@@ -1701,6 +1702,7 @@ def health():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "provider_router_build": ROUTER_BUILD,
         "providers": {
             **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
@@ -1749,15 +1751,18 @@ def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(defau
         platform = detect_platform(body.url)
         provider_status = PROVIDER_ROUTER.status()
         if platform == "youtube":
+            youtube_status = provider_status.get("youtube") or {}
+            order = youtube_status.get("order") or ["ahm7", "prexzy"]
             configured = [
-                name for name in provider_status["youtube"]["order"]
-                if provider_status["youtube"].get(name) is True
+                name for name in order
+                if youtube_status.get(name) is True
             ]
             provider_name = configured[0] if configured else (
                 "yt-dlp" if PROVIDER_FALLBACK_YTDLP else "unconfigured"
             )
         else:
-            provider_name = "cobalt" if provider_status["social"]["cobalt"] else (
+            social_status = provider_status.get("social") or {}
+            provider_name = "cobalt" if social_status.get("cobalt") is True else (
                 "yt-dlp" if PROVIDER_FALLBACK_YTDLP else "unconfigured"
             )
         return {
