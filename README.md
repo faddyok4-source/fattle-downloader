@@ -480,3 +480,50 @@ If the 4-worker parallel path still fails, the coordinator aborts that
 multipart upload and retries the same small ranges sequentially with one
 worker. This is useful for CDNs that advertise byte ranges but close concurrent
 connections early.
+
+
+# v3.3 — truthful Range detection + whole-stream fallback
+
+A source is now considered range-capable only if the `bytes=0-0` probe
+actually returns:
+
+```text
+Content-Range: bytes 0-0/TOTAL
+```
+
+A response such as:
+
+```text
+Content-Range: bytes 0-50441526/50441527
+```
+
+means the origin ignored the requested range. Fattle disables 4-worker mode
+for that source and uses one normal streaming GET.
+
+If a CDN changes behavior after the probe, the job tries:
+1. parallel small ranges;
+2. one-worker sequential small ranges;
+3. full-source stream to R2.
+
+Whole-stream mode retries from the beginning up to
+`STREAM_DOWNLOAD_RETRIES` times.
+
+# v3.4 — stability pass
+
+This build is intended to reduce repeated deploy/fix cycles.
+
+Additional protections:
+
+- retries transient Render worker `502/503/504`, timeouts, and connection errors;
+- returns structured range-worker errors instead of generic HTML 500 pages;
+- verifies full-stream byte integrity before completing the R2 multipart upload;
+- tries the next YouTube provider when a provider resolves but its returned CDN URL fails;
+- skips pointless sequential range retries when the origin clearly ignores Range;
+- tries each configured worker sequentially when only one Render worker is unhealthy;
+- treats MongoDB status writes as best-effort after job creation;
+- makes cancellation effective during coordinator streaming/range progress;
+- falls back from small Bot API archive upload to MTProto before giving up;
+- strips sensitive resolver headers on cross-host redirects;
+- fixes Telegram status-message line breaks;
+- makes Deno installation optional/best-effort when provider fallback is disabled;
+- `/health` includes build ID, configured worker count, storage state, and configuration warnings.

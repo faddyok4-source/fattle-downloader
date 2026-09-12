@@ -66,6 +66,7 @@ STORAGE_REGION = os.getenv("STORAGE_REGION", "auto").strip() or "auto"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ARCHIVE_CHAT_ID = os.getenv("ARCHIVE_CHAT_ID", "").strip()
+TELEGRAM_API_RETRIES = max(1, min(5, int(os.getenv("TELEGRAM_API_RETRIES", "3"))))
 
 # Normal Bot API for small-file upload and Telegram server-side copyMessage.
 TELEGRAM_DIRECT_MAX_BYTES = int(os.getenv("TELEGRAM_DIRECT_MAX_BYTES", "49000000"))
@@ -105,6 +106,11 @@ WORKER_RANGE_RETRY_BACKOFF_SECONDS = max(
     0.25,
     min(10.0, float(os.getenv("WORKER_RANGE_RETRY_BACKOFF_SECONDS", "1.0")))
 )
+STREAM_DOWNLOAD_RETRIES = max(1, min(5, int(os.getenv("STREAM_DOWNLOAD_RETRIES", "3"))))
+WORKER_CALL_RETRIES = max(1, min(6, int(os.getenv("WORKER_CALL_RETRIES", "4"))))
+WORKER_CALL_BACKOFF_SECONDS = max(0.5, min(10.0, float(os.getenv("WORKER_CALL_BACKOFF_SECONDS", "1.5"))))
+MONGO_STATUS_RETRIES = max(1, min(4, int(os.getenv("MONGO_STATUS_RETRIES", "2"))))
+DOWNLOADER_BUILD = "3.4-stability"
 
 MAX_ACTIVE_JOBS = max(1, min(16, int(os.getenv("MAX_ACTIVE_JOBS", "2"))))
 _job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
@@ -115,7 +121,7 @@ YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 
 # Resolver-provider settings. Provider secrets are used only by the coordinator.
 PROVIDER_TIMEOUT_SECONDS = max(5, min(120, int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "30"))))
-PROVIDER_RETRIES = max(0, min(3, int(os.getenv("PROVIDER_RETRIES", "2"))))
+PROVIDER_RETRIES = max(0, min(4, int(os.getenv("PROVIDER_RETRIES", "3"))))
 PROVIDER_FALLBACK_YTDLP = os.getenv("PROVIDER_FALLBACK_YTDLP", "false").strip().lower() in {"1", "true", "yes", "on"}
 PROVIDER_ROUTER = ProviderRouter.from_env(
     timeout_seconds=PROVIDER_TIMEOUT_SECONDS,
@@ -150,7 +156,7 @@ TERABOX_HINTS = (
     "terafileshare", "terasharefile", "terasharelink",
 )
 
-app = FastAPI(title="Fattle Downloader", version="3.1-ahm7-prexzy-probe-fix")
+app = FastAPI(title="Fattle Downloader", version=DOWNLOADER_BUILD)
 
 mongo = None
 jobs = None
@@ -214,14 +220,48 @@ def telegram_api(method, *, data=None, files=None, timeout=(15, 180)):
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not configured on the coordinator")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    r = requests.post(url, data=data, files=files, timeout=timeout)
-    try:
-        payload = r.json()
-    except Exception:
-        payload = {"ok": False, "description": r.text[:500]}
-    if r.status_code >= 400 or not payload.get("ok"):
-        raise RuntimeError(f"Telegram {method} failed: {payload.get('description') or r.text[:300]}")
-    return payload.get("result")
+    last_error = None
+
+    for attempt in range(1, TELEGRAM_API_RETRIES + 1):
+        try:
+            r = requests.post(url, data=data, files=files, timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = RuntimeError(f"Telegram {method} connection failed: {exc}")
+            if attempt >= TELEGRAM_API_RETRIES:
+                raise last_error from exc
+            time.sleep(min(6.0, 1.5 * attempt))
+            continue
+
+        try:
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {"ok": False, "description": r.text[:500]}
+
+            if r.status_code < 400 and payload.get("ok"):
+                return payload.get("result")
+
+            description = payload.get("description") or r.text[:300]
+            last_error = RuntimeError(f"Telegram {method} failed: {description}")
+            retryable = r.status_code == 429 or r.status_code >= 500
+            if not retryable or attempt >= TELEGRAM_API_RETRIES:
+                raise last_error
+
+            retry_after = 0
+            params = payload.get("parameters") if isinstance(payload, dict) else None
+            if isinstance(params, dict):
+                try:
+                    retry_after = int(params.get("retry_after") or 0)
+                except Exception:
+                    retry_after = 0
+            time.sleep(min(15.0, max(float(retry_after), 1.5 * attempt)))
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+    raise last_error or RuntimeError(f"Telegram {method} failed")
 
 
 _status_push_state = {}
@@ -277,8 +317,7 @@ def _status_message_text(doc):
             lines.append(f"<code>{html.escape(err[:350])}</code>")
     if doc.get("error"):
         lines += ["", f"❌ <code>{html.escape(str(doc.get('error'))[:350])}</code>"]
-    return "\
-".join(lines)
+    return "\n".join(lines)
 
 
 def maybe_push_status(job_id, force=False):
@@ -730,10 +769,11 @@ def deliver_completed_file(job_id, chat_id, key, filename, content_type, size):
             set_job(job_id, delivery_status="sent", **result)
             return result
         except Exception as exc:
-            log.exception("Small Telegram archive upload failed")
+            log.exception("Small Telegram archive upload failed; trying MTProto next when available")
             set_job(job_id, telegram_archive_error=str(exc)[:1000])
-            if not R2_FALLBACK_LINKS:
-                raise RuntimeError(f"Telegram archive upload failed: {exc}") from exc
+            # Do not fail yet. MTProto is a second Telegram delivery path and
+            # works for small files too. This avoids losing delivery because of
+            # a transient Bot API upload problem.
 
     if size <= TELEGRAM_MTPROTO_MAX_BYTES:
         missing = telegram_archive_missing()
@@ -762,16 +802,59 @@ def deliver_completed_file(job_id, chat_id, key, filename, content_type, size):
     raise RuntimeError("Telegram delivery could not be completed and R2_FALLBACK_LINKS is disabled.")
 
 
+class JobCancelled(RuntimeError):
+    """The user cancelled a coordinator job."""
+
+
 def set_job(job_id, **fields):
+    """Best-effort status persistence.
+
+    A transient MongoDB status-update failure must not destroy a file download
+    that is otherwise progressing correctly. Job creation still requires MongoDB;
+    updates during the job are retried briefly and then logged.
+    """
     fields["updated_at"] = now()
-    if jobs is not None:
-        jobs.update_one({"job_id": job_id}, {"$set": fields}, upsert=True)
-        if any(k in fields for k in {
-            "status", "progress", "filename", "size", "worker_count",
-            "fragment_workers", "telegram_upload_progress",
-            "delivery_status", "delivery_mode", "delivery_media_type", "error",
-        }):
-            maybe_push_status(job_id)
+    if jobs is None:
+        return False
+
+    updated = False
+    for attempt in range(1, MONGO_STATUS_RETRIES + 1):
+        try:
+            jobs.update_one({"job_id": job_id}, {"$set": fields}, upsert=True)
+            updated = True
+            break
+        except Exception as exc:
+            if attempt >= MONGO_STATUS_RETRIES:
+                log.warning(
+                    "MongoDB status update failed for job %s after %s attempt(s): %s",
+                    job_id, attempt, exc,
+                )
+                break
+            time.sleep(0.25 * attempt)
+
+    if updated and any(k in fields for k in {
+        "status", "progress", "filename", "size", "worker_count",
+        "fragment_workers", "telegram_upload_progress",
+        "delivery_status", "delivery_mode", "delivery_media_type", "error",
+    }):
+        maybe_push_status(job_id)
+    return updated
+
+
+def is_cancel_requested(job_id):
+    if jobs is None:
+        return False
+    try:
+        doc = jobs.find_one({"job_id": job_id}, {"cancel_requested": 1}) or {}
+        return bool(doc.get("cancel_requested"))
+    except Exception as exc:
+        log.warning("Could not read cancel state for job %s: %s", job_id, exc)
+        return False
+
+
+def raise_if_cancelled(job_id):
+    if is_cancel_requested(job_id):
+        raise JobCancelled("Download cancelled")
 
 
 def get_job(job_id):
@@ -815,9 +898,15 @@ def safe_request(method, url, *, headers=None, stream=False, timeout=None):
         validate_public_url(current)
         current_headers = dict(request_headers)
         if normalize_host(urlparse(current).hostname) != base_host:
-            # Provider API keys are valid only for the provider origin. Never
-            # forward Authorization to an origin reached by redirect.
-            current_headers.pop("Authorization", None)
+            # Sensitive resolver headers are valid only for the original host.
+            # Never forward them to a different redirect target.
+            sensitive = {
+                "authorization", "cookie", "proxy-authorization",
+                "x-api-key", "x-auth-token", "host",
+            }
+            for header_name in list(current_headers):
+                if str(header_name).lower() in sensitive:
+                    current_headers.pop(header_name, None)
         r = requests.request(
             method,
             current,
@@ -894,13 +983,38 @@ def probe_direct(url, extra_headers=None, allow_unknown_size=False):
         ranges = False
         if r.status_code == 206:
             cr = r.headers.get("Content-Range", "")
-            m = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", cr, re.I)
-            if m and m.group(1).isdigit():
-                total = int(m.group(1))
-                ranges = True
+            m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", cr, re.I)
+            if m and m.group(3).isdigit():
+                total = int(m.group(3))
+
+                # The probe requested exactly bytes=0-0. Some provider/CDN
+                # endpoints incorrectly reply 206 while sending the entire
+                # file (for example: bytes 0-50441526/50441527). Treat those
+                # as NON-range sources so Fattle uses one safe stream.
+                returned_start = int(m.group(1))
+                returned_end = int(m.group(2))
+                probe_length = _header_int(r.headers, "Content-Length")
+                content_encoding = str(r.headers.get("Content-Encoding") or "").strip().lower()
+                ranges = (
+                    returned_start == 0
+                    and returned_end == 0
+                    and probe_length in {None, 1}
+                    and content_encoding in {"", "identity"}
+                )
+
+                if not ranges:
+                    log.info(
+                        "Origin advertised/returned HTTP 206 but ignored the "
+                        "0-0 range probe (%s); disabling multi-worker ranges",
+                        cr[:200],
+                    )
         elif r.status_code == 200:
             total = _header_int(r.headers, "Content-Length")
-            ranges = "bytes" in (r.headers.get("Accept-Ranges") or "").lower()
+
+            # Accept-Ranges by itself is not proof. The request we just sent
+            # contained Range: bytes=0-0, and HTTP 200 means the server ignored
+            # it. Do not launch parallel range workers.
+            ranges = False
         else:
             raise ValueError(f"Source returned HTTP {r.status_code}")
 
@@ -1007,6 +1121,10 @@ class ProbeRequest(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
 
 
+class RangeNotHonoredError(RuntimeError):
+    """The source ignored or changed the requested byte range."""
+
+
 def worker_download_range(body: WorkerRange):
     expected = body.end - body.start + 1
     last_error = None
@@ -1032,7 +1150,7 @@ def worker_download_range(body: WorkerRange):
             if response.status_code != 206:
                 # If the origin stopped honoring Range, retrying the same request
                 # will not help. Let the coordinator use its safer fallback.
-                raise RuntimeError(
+                raise RangeNotHonoredError(
                     f"Range download expected HTTP 206 but received {response.status_code}"
                 )
 
@@ -1040,7 +1158,7 @@ def worker_download_range(body: WorkerRange):
             if content_range and not content_range.lower().startswith(
                 f"bytes {body.start}-{body.end}/".lower()
             ):
-                raise RuntimeError(
+                raise RangeNotHonoredError(
                     f"Origin returned unexpected Content-Range: {content_range[:200]}"
                 )
 
@@ -1085,10 +1203,9 @@ def worker_download_range(body: WorkerRange):
             last_error = exc
 
             # HTTP status/content-range errors are normally deterministic.
-            deterministic = isinstance(exc, RuntimeError) and (
-                "expected HTTP 206" in str(exc)
-                or "unexpected Content-Range" in str(exc)
-                or "more bytes than requested" in str(exc)
+            deterministic = isinstance(exc, RangeNotHonoredError) or (
+                isinstance(exc, RuntimeError)
+                and "more bytes than requested" in str(exc)
             )
             if deterministic or attempt >= WORKER_RANGE_RETRIES:
                 raise RuntimeError(
@@ -1117,7 +1234,11 @@ def worker_download_range(body: WorkerRange):
 
 
 
-def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
+class StreamIntegrityError(RuntimeError):
+    """A full-file stream was partial or internally inconsistent."""
+
+
+def _stream_source_to_r2_once(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
     """Stream a non-range/unknown-size source into R2 using multipart upload.
 
     No whole file is written to local disk. The actual byte count is measured
@@ -1147,8 +1268,38 @@ def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content
             "Estimated-Content-Length",
             "X-Estimated-Content-Length",
         )
-        expected = response_size or response_estimate or estimated_size
-        if expected and expected > MAX_FILE_BYTES:
+        content_encoding = str(response.headers.get("Content-Encoding") or "").strip().lower()
+        exact_expected = None
+
+        if response.status_code == 206:
+            # A normal whole-file fallback request contains no Range header. If
+            # the origin nevertheless sends 206, accept it only when the
+            # Content-Range proves that this is the entire object from byte 0.
+            content_range = str(response.headers.get("Content-Range") or "")
+            match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range, re.I)
+            if not match or not match.group(3).isdigit():
+                raise StreamIntegrityError(
+                    f"Full stream received incomplete HTTP 206 response: {content_range[:200] or 'missing Content-Range'}"
+                )
+            start_byte = int(match.group(1))
+            end_byte = int(match.group(2))
+            total_bytes = int(match.group(3))
+            if start_byte != 0 or end_byte != total_bytes - 1:
+                raise StreamIntegrityError(
+                    f"Full stream received only bytes {start_byte}-{end_byte}/{total_bytes}"
+                )
+            if content_encoding not in {"", "identity"}:
+                raise StreamIntegrityError("Encoded HTTP 206 response cannot be verified safely")
+            if response_size is not None and response_size != total_bytes:
+                raise StreamIntegrityError(
+                    f"HTTP 206 length mismatch: Content-Length={response_size}, total={total_bytes}"
+                )
+            exact_expected = total_bytes
+        elif content_encoding in {"", "identity"} and response_size is not None:
+            exact_expected = response_size
+
+        expected = exact_expected or response_estimate or estimated_size
+        if expected and int(expected) > MAX_FILE_BYTES:
             raise RuntimeError(f"File is too large ({expected} bytes). Limit is {MAX_FILE_BYTES} bytes")
 
         upload = client.create_multipart_upload(
@@ -1192,10 +1343,15 @@ def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content
             report_bucket = received // (4 * 1024 * 1024)
             if report_bucket != last_reported:
                 last_reported = report_bucket
+                raise_if_cancelled(job_id)
                 set_job(job_id, progress=pct, downloaded_bytes=received)
 
         if not received:
             raise RuntimeError("The source returned an empty file")
+        if exact_expected is not None and received != int(exact_expected):
+            raise StreamIntegrityError(
+                f"Incomplete full stream: expected {int(exact_expected)} bytes, got {received}"
+            )
         if buffer:
             flush_part(buffer)
         if not parts:
@@ -1218,6 +1374,60 @@ def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content
         raise
     finally:
         response.close()
+
+
+def stream_source_to_r2(job_id, source_url, source_headers, storage_key, content_type, estimated_size=None):
+    """Retry a whole-file stream from scratch when a CDN disconnects.
+
+    This path is used for origins that do not reliably honor byte ranges.
+    Each failed attempt aborts its R2 multipart upload inside the one-shot
+    helper, then the next attempt starts a fresh source connection.
+    """
+    last_error = None
+
+    for attempt in range(1, STREAM_DOWNLOAD_RETRIES + 1):
+        try:
+            if attempt > 1:
+                set_job(
+                    job_id,
+                    status="retrying_stream",
+                    stream_attempt=attempt,
+                    progress=5,
+                    downloaded_bytes=0,
+                )
+            result = _stream_source_to_r2_once(
+                job_id,
+                source_url,
+                source_headers,
+                storage_key,
+                content_type,
+                estimated_size=estimated_size,
+            )
+            result["attempts"] = attempt
+            return result
+
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= STREAM_DOWNLOAD_RETRIES:
+                break
+
+            delay = min(6.0, 1.5 * attempt)
+            log.warning(
+                "Whole-file stream failed on attempt %s/%s for job %s: %s. "
+                "Retrying from the beginning in %.1fs",
+                attempt,
+                STREAM_DOWNLOAD_RETRIES,
+                job_id,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Whole-file stream failed after {STREAM_DOWNLOAD_RETRIES} attempt(s): {last_error}"
+    ) from last_error
 
 
 def ffmpeg_location():
@@ -1462,22 +1672,72 @@ def worker_download_youtube(body: WorkerYoutube):
 
 
 def call_worker(url, path, payload):
-    r = requests.post(
-        url + path,
-        json=payload,
-        headers={"X-Worker-Secret": WORKER_SECRET},
-        timeout=(15, DOWNLOAD_TIMEOUT),
-    )
-    if r.status_code >= 400:
-        detail = r.text[:700]
+    retry_statuses = {408, 425, 429, 500, 502, 503, 504}
+    last_error = None
+
+    for attempt in range(1, WORKER_CALL_RETRIES + 1):
+        response = None
         try:
-            payload = r.json()
-            if isinstance(payload, dict) and payload.get("detail"):
-                detail = str(payload["detail"])[:700]
-        except Exception:
-            pass
-        raise RuntimeError(f"Worker {url} failed: {detail}")
-    return r.json()
+            response = requests.post(
+                url + path,
+                json=payload,
+                headers={"X-Worker-Secret": WORKER_SECRET},
+                timeout=(30, DOWNLOAD_TIMEOUT),
+            )
+
+            if response.status_code < 400:
+                try:
+                    data = response.json()
+                except Exception as exc:
+                    raise RuntimeError("Worker returned a non-JSON success response") from exc
+                if not isinstance(data, dict):
+                    raise RuntimeError("Worker returned an invalid JSON response")
+                return data
+
+            detail = response.text[:700]
+            try:
+                error_payload = response.json()
+                if isinstance(error_payload, dict) and error_payload.get("detail"):
+                    detail = str(error_payload["detail"])[:700]
+            except Exception:
+                pass
+
+            last_error = RuntimeError(f"Worker {url} failed: {detail}")
+            if response.status_code not in retry_statuses or attempt >= WORKER_CALL_RETRIES:
+                raise last_error
+
+            retry_after = 0.0
+            try:
+                retry_after = float(response.headers.get("Retry-After") or 0)
+            except Exception:
+                retry_after = 0.0
+            delay = max(retry_after, WORKER_CALL_BACKOFF_SECONDS * attempt)
+            log.warning(
+                "Worker %s returned HTTP %s on attempt %s/%s. Retrying in %.1fs",
+                url, response.status_code, attempt, WORKER_CALL_RETRIES, delay,
+            )
+            time.sleep(min(15.0, delay))
+
+        except requests.RequestException as exc:
+            last_error = RuntimeError(f"Worker {url} connection failed: {exc}")
+            if attempt >= WORKER_CALL_RETRIES:
+                raise last_error from exc
+            delay = WORKER_CALL_BACKOFF_SECONDS * attempt
+            log.warning(
+                "Worker %s connection error on attempt %s/%s: %s. Retrying in %.1fs",
+                url, attempt, WORKER_CALL_RETRIES, exc, delay,
+            )
+            time.sleep(min(15.0, delay))
+        except RuntimeError:
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    raise last_error or RuntimeError(f"Worker {url} failed")
 
 
 def maybe_deliver(job_id, chat_id, key, filename, content_type, size):
@@ -1505,6 +1765,7 @@ def run_resolved_direct_job(
     provider=None,
     allow_unknown_size=False,
 ):
+    raise_if_cancelled(job_id)
     probe = probe_direct(
         source_url,
         extra_headers=source_headers,
@@ -1563,6 +1824,7 @@ def run_resolved_direct_job(
             )
 
             try:
+                raise_if_cancelled(job_id)
                 payloads = []
                 for index, (part_number, start, end) in enumerate(ranges):
                     worker = active_workers[index % len(active_workers)]
@@ -1578,17 +1840,28 @@ def run_resolved_direct_job(
                     }))
 
                 parts = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
-                    futures = [
-                        ex.submit(call_worker, worker, "/worker/range", payload)
-                        for worker, payload in payloads
-                    ]
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+                futures = [
+                    ex.submit(call_worker, worker, "/worker/range", payload)
+                    for worker, payload in payloads
+                ]
+                try:
                     for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
                         parts.append(fut.result())
+                        raise_if_cancelled(job_id)
                         set_job(
                             job_id,
                             progress=min(85, 5 + int(75 * idx / max(1, len(ranges)))),
                         )
+                except Exception:
+                    # Do not wait for every queued range after one part already
+                    # proved the strategy is broken or the user cancelled.
+                    for pending in futures:
+                        pending.cancel()
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    ex.shutdown(wait=True)
 
                 parts.sort(key=lambda x: x["PartNumber"])
                 client.complete_multipart_upload(
@@ -1617,26 +1890,80 @@ def run_resolved_direct_job(
 
         try:
             _download_ranges(workers, fallback_mode=False)
-        except Exception as first_exc:
-            # Some CDNs dislike several concurrent Range requests even though
-            # they advertise Accept-Ranges. Retry the file sequentially using
-            # the same small pieces before failing the entire job.
-            log.warning(
-                "Parallel range download failed for job %s: %s. "
-                "Retrying with one worker and small sequential ranges.",
-                job_id,
-                first_exc,
-            )
-            set_job(
-                job_id,
-                status="retrying_download",
-                progress=5,
-                range_parallel_error=str(first_exc)[:1000],
-                worker_count=1,
-            )
-            _download_ranges([workers[0]], fallback_mode=True)
+            final_size = int(probe["size"])
 
-        final_size = int(probe["size"])
+        except Exception as first_exc:
+            raise_if_cancelled(job_id)
+            first_text = str(first_exc).lower()
+            range_is_invalid = (
+                "unexpected content-range" in first_text
+                or "expected http 206" in first_text
+                or "range download expected http 206" in first_text
+            )
+
+            sequential_error = first_exc
+            if not range_is_invalid:
+                # A worker may simply be sleeping/down. Try the available workers
+                # one at a time before giving up on byte ranges entirely.
+                set_job(
+                    job_id,
+                    status="retrying_download",
+                    progress=5,
+                    range_parallel_error=str(first_exc)[:1000],
+                    worker_count=1,
+                )
+                for worker in workers:
+                    try:
+                        log.warning(
+                            "Parallel range download failed for job %s. "
+                            "Trying sequential ranges via %s",
+                            job_id, worker,
+                        )
+                        _download_ranges([worker], fallback_mode=True)
+                        final_size = int(probe["size"])
+                        sequential_error = None
+                        break
+                    except JobCancelled:
+                        raise
+                    except Exception as exc:
+                        sequential_error = exc
+                        log.warning("Sequential worker %s failed for job %s: %s", worker, job_id, exc)
+
+            if sequential_error is not None:
+                # The source either does not really support Range, every worker
+                # is unavailable, or the CDN changed behavior after probing.
+                # A normal single GET on the coordinator is the safest fallback.
+                log.warning(
+                    "Range strategies exhausted for job %s: %s. "
+                    "Switching to full-source streaming.",
+                    job_id,
+                    sequential_error,
+                )
+                set_job(
+                    job_id,
+                    status="stream_fallback",
+                    progress=5,
+                    worker_count=1,
+                    range_fallback_error=str(sequential_error)[:1000],
+                    downloaded_bytes=0,
+                )
+                raise_if_cancelled(job_id)
+                streamed = stream_source_to_r2(
+                    job_id,
+                    probe["url"],
+                    effective_headers,
+                    key,
+                    probe["content_type"],
+                    estimated_size=probe.get("size") or probe.get("estimated_size"),
+                )
+                final_size = int(streamed["size"])
+                set_job(
+                    job_id,
+                    size=final_size,
+                    downloaded_bytes=final_size,
+                    progress=85,
+                    stream_fallback=True,
+                )
     else:
         set_job(
             job_id,
@@ -1658,6 +1985,7 @@ def run_resolved_direct_job(
         set_job(job_id, size=final_size, downloaded_bytes=final_size, progress=85)
 
     set_job(job_id, status="stored", progress=92, storage_key=key, size=final_size)
+    raise_if_cancelled(job_id)
     if maybe_deliver(job_id, request.chat_id, key, filename, probe["content_type"], final_size):
         set_job(job_id, status="complete", progress=100, completed_at=now())
         maybe_push_status(job_id, force=True)
@@ -1676,6 +2004,63 @@ def run_direct_job(job_id, request: JobCreate):
 def run_provider_media_job(job_id, request: JobCreate):
     media_quality = "best" if str(request.quality or "").lower() == "original" else request.quality
     platform = detect_platform(request.url)
+    raise_if_cancelled(job_id)
+
+    if platform == "youtube":
+        provider_names = PROVIDER_ROUTER.youtube_provider_names()
+        if not provider_names:
+            raise ProviderError("No YouTube provider is configured")
+
+        errors = []
+        for index, provider_name in enumerate(provider_names, 1):
+            raise_if_cancelled(job_id)
+            set_job(
+                job_id,
+                status="resolving_provider",
+                source_type="youtube",
+                provider=provider_name,
+                provider_attempt=index,
+                progress=3,
+                requested_quality=media_quality,
+                worker_count=0,
+                fragment_workers=0,
+            )
+            try:
+                resolved = PROVIDER_ROUTER.resolve_youtube_provider(
+                    provider_name, request.url, media_quality
+                )
+                validate_public_url(resolved.url)
+                set_job(job_id, provider=resolved.provider)
+                # Important: fallback covers BOTH resolver failure and a broken
+                # direct URL/CDN. AHM7 can resolve successfully yet its returned
+                # CDN URL may later fail; in that case Prexzy gets a full try.
+                return run_resolved_direct_job(
+                    job_id,
+                    request,
+                    resolved.url,
+                    source_headers=resolved.headers or {},
+                    source_type="youtube",
+                    requested_quality=media_quality,
+                    filename_hint=resolved.filename,
+                    provider=resolved.provider,
+                    allow_unknown_size=True,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                errors.append(f"{provider_name}: {exc}")
+                log.warning(
+                    "YouTube provider pipeline %s failed for job %s: %s",
+                    provider_name, job_id, exc,
+                )
+                set_job(
+                    job_id,
+                    provider_error=str(exc)[:700],
+                    provider_attempts=errors[-4:],
+                )
+
+        raise ProviderError(" | ".join(errors)[-1800:] or "All YouTube providers failed")
+
     set_job(
         job_id,
         status="resolving_provider",
@@ -1752,6 +2137,7 @@ def run_ytdlp_media_job(job_id, request: JobCreate):
         size=result["size"],
         content_type=result["content_type"],
     )
+    raise_if_cancelled(job_id)
     if maybe_deliver(
         job_id, request.chat_id, result["storage_key"], result["filename"],
         result["content_type"], result["size"],
@@ -1781,11 +2167,7 @@ def run_media_job(job_id, request: JobCreate):
 
 def run_job(job_id, request: JobCreate):
     try:
-        if jobs is not None:
-            doc = jobs.find_one({"job_id": job_id}, {"cancel_requested": 1}) or {}
-            if doc.get("cancel_requested"):
-                set_job(job_id, status="cancelled")
-                return
+        raise_if_cancelled(job_id)
         kind = source_kind(request.url)
         if kind == "media":
             run_media_job(job_id, request)
@@ -1793,6 +2175,8 @@ def run_job(job_id, request: JobCreate):
             if PROVIDER_ROUTER.terabox.configured:
                 try:
                     run_terabox_provider_job(job_id, request)
+                except JobCancelled:
+                    raise
                 except Exception as exc:
                     log.warning("TeraBox provider failed for %s: %s", job_id, exc)
                     set_job(job_id, provider_error=str(exc)[:500])
@@ -1819,6 +2203,9 @@ def run_job(job_id, request: JobCreate):
                     run_media_job(job_id, request)
                 else:
                     raise
+    except JobCancelled:
+        log.info("Download job %s cancelled", job_id)
+        set_job(job_id, status="cancelled", progress=0, error=None)
     except Exception as exc:
         log.exception("Download job %s failed", job_id)
         set_job(job_id, status="failed", error=str(exc)[:1000])
@@ -1836,6 +2223,26 @@ def _run_admitted_job(job_id, request):
         _job_slots.release()
 
 
+def config_warnings():
+    warnings = []
+    if not WORKER_SECRET:
+        warnings.append("WORKER_SECRET missing")
+    if not all((STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)):
+        warnings.append("R2 storage configuration incomplete")
+    if COORDINATOR_ENABLED:
+        if not API_SECRET:
+            warnings.append("DOWNLOADER_API_SECRET missing")
+        if not MONGODB_URI:
+            warnings.append("MONGODB_URI missing")
+        if not WORKER_URLS:
+            warnings.append("No WORKER_1..WORKER_4 URLs configured")
+        if not BOT_TOKEN:
+            warnings.append("BOT_TOKEN missing")
+        if not ARCHIVE_CHAT_ID:
+            warnings.append("ARCHIVE_CHAT_ID missing")
+    return warnings
+
+
 @app.get("/")
 @app.head("/")
 def root():
@@ -1846,7 +2253,11 @@ def root():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "downloader_build": DOWNLOADER_BUILD,
         "provider_router_build": ROUTER_BUILD,
+        "storage_configured": all((STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)),
+        "worker_urls_configured": len(WORKER_URLS),
+        "config_warnings": config_warnings(),
         "providers": {
             **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
@@ -1864,7 +2275,11 @@ def health():
         "deno_ready": bool(deno_location()),
         "ffmpeg_ready": bool(ffmpeg_location()),
         "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
+        "downloader_build": DOWNLOADER_BUILD,
         "provider_router_build": ROUTER_BUILD,
+        "storage_configured": all((STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_ACCESS_KEY, STORAGE_SECRET_KEY)),
+        "worker_urls_configured": len(WORKER_URLS),
+        "config_warnings": config_warnings(),
         "providers": {
             **PROVIDER_ROUTER.status(),
             "yt_dlp_fallback": PROVIDER_FALLBACK_YTDLP,
@@ -1875,7 +2290,12 @@ def health():
 @app.post("/worker/range")
 def worker_range(body: WorkerRange, x_worker_secret: str | None = Header(default=None)):
     auth_worker(x_worker_secret)
-    return worker_download_range(body)
+    try:
+        return worker_download_range(body)
+    except RuntimeError as exc:
+        # Deterministic source/range failures are not Render 500s. Returning a
+        # structured 422 lets the coordinator switch strategy immediately.
+        raise HTTPException(status_code=422, detail=str(exc)[:900])
 
 
 @app.post("/worker/media")
