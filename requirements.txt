@@ -3,7 +3,7 @@ uvicorn[standard]>=0.35,<1
 requests>=2.32
 boto3>=1.35
 pymongo[srv]>=4.14
-yt-dlp>=2026.1.1
+yt-dlp[default]==2026.08.19
 
 requests-toolbelt>=1.0
 certifi>=2025.1

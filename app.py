@@ -17,6 +17,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from worker_pool import WorkerPool
 from urllib.parse import unquote, urljoin, urlparse
 
 import boto3
@@ -27,6 +28,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, DESCENDING
 from pymongo.server_api import ServerApi
+import yt_dlp
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 from requests_toolbelt.multipart.encoder import MultipartEncoder
@@ -51,7 +53,8 @@ WORKER_URLS = [
     os.getenv("WORKER_3", "").strip().rstrip("/"),
     os.getenv("WORKER_4", "").strip().rstrip("/"),
 ]
-WORKER_URLS = [x for x in WORKER_URLS if x]
+WORKER_URLS = list(dict.fromkeys(x for x in WORKER_URLS if x))
+_worker_pool = WorkerPool(WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])
 
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "fattle_downloader").strip()
@@ -87,15 +90,39 @@ MAX_REDIRECTS = max(1, min(10, int(os.getenv("MAX_REDIRECTS", "5"))))
 DOWNLOAD_TIMEOUT = max(30, min(3600, int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "900"))))
 MIN_MULTIPART_PART = 5 * 1024 * 1024
 MAX_WORKERS_PER_JOB = 4
+MAX_ACTIVE_JOBS = max(1, min(16, int(os.getenv("MAX_ACTIVE_JOBS", "2"))))
+_job_slots = threading.BoundedSemaphore(MAX_ACTIVE_JOBS)
 YTDLP_FRAGMENT_CONCURRENCY = max(
     1, min(4, int(os.getenv("YTDLP_FRAGMENT_CONCURRENCY", "4")))
 )
 YTDLP_RETRIES = max(1, min(10, int(os.getenv("YTDLP_RETRIES", "5"))))
 
+# Deno is installed into the project by build.sh. yt-dlp uses it for
+# JavaScript challenge handling where supported (especially YouTube).
+DENO_BIN = os.getenv(
+    "DENO_BIN",
+    str((Path(__file__).resolve().parent / ".deno" / "bin" / "deno").resolve()),
+).strip()
+
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}
+MEDIA_HOST_SUFFIXES = (
+    "youtube.com",
+    "youtu.be",
+    "tiktok.com",
+    "tiktokv.com",
+    "instagram.com",
+    "facebook.com",
+    "fb.watch",
+    "twitter.com",
+    "x.com",
+    "reddit.com",
+    "redd.it",
+    "vimeo.com",
+    "soundcloud.com",
+)
 TERABOX_HINTS = ("terabox", "1024tera", "nephobox", "4funbox", "mirrobox")
 
-app = FastAPI(title="Fattle Downloader", version="1.4-url-first-auto-detect")
+app = FastAPI(title="Fattle Downloader", version="1.6-youtube-deno-multimedia")
 
 mongo = None
 jobs = None
@@ -726,10 +753,17 @@ def safe_request(method, url, *, headers=None, stream=False, timeout=None):
 
 def source_kind(url):
     host = normalize_host(urlparse(url).hostname)
-    if host in YOUTUBE_HOSTS or host.endswith(".youtube.com"):
-        return "youtube"
+
     if any(x in host for x in TERABOX_HINTS):
         return "terabox"
+
+    if host in YOUTUBE_HOSTS or host.endswith(".youtube.com"):
+        return "media"
+
+    for suffix in MEDIA_HOST_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return "media"
+
     return "direct"
 
 
@@ -883,6 +917,22 @@ def ffmpeg_location():
         return None
 
 
+def deno_location():
+    """Return a usable Deno executable path, if installed."""
+    configured = (DENO_BIN or "").strip()
+    if configured and Path(configured).exists():
+        return configured
+    found = shutil.which("deno")
+    return found or None
+
+
+def ytdlp_js_runtime_options():
+    deno = deno_location()
+    if not deno:
+        return {}
+    return {"deno": {"path": deno}}
+
+
 def ytdlp_format(quality):
     """Prefer the requested quality, but always keep a general fallback.
 
@@ -929,9 +979,9 @@ def friendly_ytdlp_error(message):
 
     if "sign in to confirm" in low or "not a bot" in low:
         return (
-            "This site is asking this cloud server to sign in or complete verification. "
-            "This downloader does not bypass site verification. Try a public direct-file URL "
-            "or another public source."
+            "YouTube/site verification blocked this cloud server request. "
+            "The downloader does not bypass sign-in or anti-bot verification. "
+            "Try again later or use another public/authorized source."
         )
     if "private video" in low or "private" in low and "video" in low:
         return "This media is private and is not available to the public downloader."
@@ -939,6 +989,17 @@ def friendly_ytdlp_error(message):
         return "This media requires account or premium access and is not supported."
     if "copyright" in low and "unavailable" in low:
         return "This media is unavailable from the source."
+    if "unexpected response from webpage request" in low and "tiktok" in low:
+        return (
+            "TikTok did not return a usable public media response to this server. "
+            "The current TikTok extractor or the cloud-server request may be rejected. "
+            "Try again later or use another public source."
+        )
+    if "http error 429" in low or "too many requests" in low:
+        return (
+            "The source rate-limited this server (HTTP 429). "
+            "Please wait and try again later."
+        )
     if "requested format is not available" in low:
         return (
             "The source did not expose a downloadable format for this media. "
@@ -1008,6 +1069,10 @@ def worker_download_media(body: WorkerMedia):
             "overwrites": True,
             "progress_hooks": [media_progress],
         }
+
+        js_runtimes = ytdlp_js_runtime_options()
+        if js_runtimes:
+            opts["js_runtimes"] = js_runtimes
 
         if ffmpeg:
             opts["ffmpeg_location"] = ffmpeg
@@ -1131,26 +1196,25 @@ def run_direct_job(job_id, request: JobCreate):
     set_job(job_id, status="downloading", storage_key=key, worker_count=count, progress=5)
     try:
         ranges = split_ranges(probe["size"], count)
-        workers = (WORKER_URLS or [os.getenv("SELF_URL", "").strip().rstrip("/")])[:count]
-        if len(workers) < count or any(not x for x in workers):
-            raise RuntimeError("Not enough worker URLs are configured")
-        payloads = []
-        for (part_number, start, end), worker in zip(ranges, workers):
-            payloads.append((worker, {
-                "job_id": job_id,
-                "source_url": probe["url"],
-                "storage_key": key,
-                "upload_id": upload_id,
-                "part_number": part_number,
-                "start": start,
-                "end": end,
-            }))
-        parts = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
-            futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
-            for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-                parts.append(fut.result())
-                set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
+        # Reserve distinct workers atomically; share load tracking with media jobs.
+        with _worker_pool.reserve(count) as workers:
+            payloads = []
+            for (part_number, start, end), worker in zip(ranges, workers):
+                payloads.append((worker, {
+                    "job_id": job_id,
+                    "source_url": probe["url"],
+                    "storage_key": key,
+                    "upload_id": upload_id,
+                    "part_number": part_number,
+                    "start": start,
+                    "end": end,
+                }))
+            parts = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as ex:
+                futures = [ex.submit(call_worker, worker, "/worker/range", payload) for worker, payload in payloads]
+                for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                    parts.append(fut.result())
+                    set_job(job_id, progress=min(85, 5 + int(75 * idx / count)))
         parts.sort(key=lambda x: x["PartNumber"])
         client.complete_multipart_upload(
             Bucket=STORAGE_BUCKET,
@@ -1180,12 +1244,18 @@ def run_media_job(job_id, request: JobCreate):
         worker_count=1, fragment_workers=YTDLP_FRAGMENT_CONCURRENCY,
         requested_quality=media_quality,
     )
-    result = call_worker(WORKER_URLS[0], "/worker/media", {
-        "job_id": job_id,
-        "source_url": request.url,
-        "storage_key_prefix": f"jobs/{job_id}",
-        "quality": media_quality,
-    })
+    # Spread independent media downloads across available workers.
+    # A single extractor job still runs on one worker (with local fragment concurrency).
+    with _worker_pool.reserve() as selected:
+        worker = selected[0]
+        set_job(job_id, worker_number=WORKER_URLS.index(worker) + 1)
+        result = call_worker(worker, "/worker/media", {
+            "job_id": job_id,
+            "source_url": request.url,
+            "storage_key_prefix": f"jobs/{job_id}",
+            "quality": media_quality,
+        })
+
     set_job(
         job_id,
         status="stored",
@@ -1216,7 +1286,7 @@ def run_job(job_id, request: JobCreate):
                 set_job(job_id, status="cancelled")
                 return
         kind = source_kind(request.url)
-        if kind == "youtube":
+        if kind == "media":
             run_media_job(job_id, request)
         elif kind == "terabox":
             # Only public direct-file TeraBox URLs are accepted.
@@ -1242,6 +1312,18 @@ def run_job(job_id, request: JobCreate):
         set_job(job_id, status="failed", error=str(exc)[:1000])
 
 
+def _run_admitted_job(job_id, request):
+    try:
+        # Status pushes must not delay the job-creation response to Vercel.
+        maybe_push_status(job_id, force=True)
+        run_job(job_id, request)
+    except Exception as exc:
+        log.exception("Admitted job failed before completion: %s", job_id)
+        set_job(job_id, status="failed", error=str(exc)[:1000])
+    finally:
+        _job_slots.release()
+
+
 @app.get("/")
 @app.head("/")
 def root():
@@ -1249,6 +1331,9 @@ def root():
         "service": "fattle-downloader", "role": ROLE, "coordinator": COORDINATOR_ENABLED,
         "mtproto": mtproto_configured(), "telegram_archive_ready": mtproto_configured(),
         "telegram_missing": telegram_archive_missing(), "r2_fallback_links": R2_FALLBACK_LINKS,
+        "deno_ready": bool(deno_location()),
+        "ffmpeg_ready": bool(ffmpeg_location()),
+        "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
     }
 
 
@@ -1259,6 +1344,9 @@ def health():
         "ok": True, "role": ROLE, "coordinator": COORDINATOR_ENABLED,
         "telegram_archive_ready": mtproto_configured(),
         "telegram_missing": telegram_archive_missing(),
+        "deno_ready": bool(deno_location()),
+        "ffmpeg_ready": bool(ffmpeg_location()),
+        "yt_dlp_version": getattr(getattr(yt_dlp, "version", None), "__version__", "unknown"),
     }
 
 
@@ -1299,8 +1387,8 @@ def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(defau
         raise HTTPException(status_code=400, detail=str(exc))
 
     kind = source_kind(body.url)
-    if kind == "youtube":
-        return {"ok": True, "kind": "media", "source_type": "youtube"}
+    if kind == "media":
+        return {"ok": True, "kind": "media", "source_type": "media"}
 
     try:
         info = probe_direct(body.url)
@@ -1326,6 +1414,7 @@ def probe_url(body: ProbeRequest, x_downloader_secret: str | None = Header(defau
             or "reliable file size" in low
             or "http 405" in low
             or "http 403" in low
+            or "http 429" in low
         ):
             return {"ok": True, "kind": "media", "source_type": "media"}
         raise HTTPException(status_code=400, detail=message)
@@ -1342,23 +1431,34 @@ def create_job(body: JobCreate, x_downloader_secret: str | None = Header(default
         validate_public_url(body.url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if not _job_slots.acquire(blocking=False):
+        raise HTTPException(429, "Downloader is busy. Try again shortly.", headers={"Retry-After": "15"})
     job_id = uuid.uuid4().hex
-    jobs.insert_one({
-        "job_id": job_id,
-        "user_id": int(body.user_id),
-        "chat_id": int(body.chat_id),
-        "source_url": body.url,
-        "requested_quality": body.quality,
-        "status_message_id": int(body.status_message_id) if body.status_message_id else None,
-        "status": "queued",
-        "progress": 0,
-        "created_at": now(),
-        "updated_at": now(),
-        "cancel_requested": False,
-    })
-    maybe_push_status(job_id, force=True)
-    threading.Thread(target=run_job, args=(job_id, body), daemon=True).start()
-    return {"ok": True, "job_id": job_id, "status": "queued", "telegram_archive_ready": mtproto_configured()}
+    try:
+        jobs.insert_one({
+            "job_id": job_id,
+            "user_id": int(body.user_id),
+            "chat_id": int(body.chat_id),
+            "source_url": body.url,
+            "requested_quality": body.quality,
+            "status_message_id": int(body.status_message_id) if body.status_message_id else None,
+            "status": "queued",
+            "progress": 0,
+            "created_at": now(),
+            "updated_at": now(),
+            "cancel_requested": False,
+        })
+        response = {"ok": True, "job_id": job_id, "status": "queued", "telegram_archive_ready": mtproto_configured()}
+        threading.Thread(target=_run_admitted_job, args=(job_id, body), daemon=True).start()
+        return response
+    except Exception:
+        _job_slots.release()
+        try:
+            set_job(job_id, status="failed", error="Unable to start download. Please try again.")
+        except Exception:
+            log.exception("Unable to record job startup failure: %s", job_id)
+        raise
+
 
 
 @app.get("/api/jobs/{job_id}")

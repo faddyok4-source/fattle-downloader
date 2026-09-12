@@ -184,3 +184,61 @@ The bot sends the URL to `/api/probe` first. Direct files start immediately in
 original quality. Media webpages return `kind=media`, so quality choices appear
 only for media. Classification is based on the actual HTTP response, not `.com`
 or a filename extension alone.
+
+
+## v1.5 — media-host routing
+
+Known media hosts such as TikTok, Instagram and YouTube are now classified as
+media before the direct-file Range probe. This prevents the URL-inspection step
+from producing a confusing HTTP 429 for sites that rate-limit generic probes.
+
+The build also pins yt-dlp to stable 2026.08.19 so a stale Render dependency
+cache cannot leave an older TikTok extractor installed.
+
+This does not bypass login, verification, private access, DRM, or a site's
+rate-limits. If TikTok rejects a cloud-server request, the job returns a short
+friendly error and can be retried later.
+
+
+## v1.6 — YouTube + TikTok + Instagram Reels
+
+This backend keeps the existing generic yt-dlp media extractor, so supported
+public TikTok videos and Instagram Reels remain supported. YouTube additionally
+gets a Deno JavaScript runtime and the `yt-dlp[default]` dependency set.
+
+Media routing:
+
+```text
+Direct file -> up to 4 range workers
+YouTube -> yt-dlp + Deno + FFmpeg
+TikTok -> yt-dlp TikTok extractor
+Instagram Reel -> yt-dlp Instagram extractor
+Other supported media pages -> yt-dlp
+```
+
+Completed files still follow:
+
+```text
+R2 staging -> private Telegram archive -> copyMessage -> user
+```
+
+The service does not add cookies or bypass login, private-access, DRM,
+paywalls, rate limits, or anti-bot verification.
+
+### Render build command
+
+Use:
+
+```text
+bash build.sh
+```
+
+After deploying, `/health` should include:
+
+```json
+{
+  "deno_ready": true,
+  "ffmpeg_ready": true,
+  "yt_dlp_version": "2026.08.19"
+}
+```

@@ -2,6 +2,6 @@ services:
   - type: web
     name: fattle-downloader
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: bash build.sh
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
