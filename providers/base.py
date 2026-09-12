@@ -33,7 +33,7 @@ class HttpClient:
 
     def __init__(self, timeout_seconds: int = 30, retries: int = 2):
         self.timeout_seconds = max(5, min(120, int(timeout_seconds)))
-        self.retries = max(0, min(3, int(retries)))
+        self.retries = max(0, min(4, int(retries)))
 
     def request(self, method: str, url: str, *, headers=None, json_body=None, params=None):
         """Make a provider request with conservative retries.
@@ -67,6 +67,10 @@ class HttpClient:
                 # 5xx may be transient, so retry until the last attempt.
                 if attempt + 1 >= attempts:
                     return response
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
             except requests.RequestException as exc:
                 last_error = ProviderError(f"Provider request failed: {exc}")
@@ -74,7 +78,7 @@ class HttpClient:
                     raise last_error
 
             if attempt + 1 < attempts:
-                time.sleep(min(2 ** attempt, 3))
+                time.sleep(min(2 ** (attempt + 1), 10))
 
         if last_response is not None:
             return last_response

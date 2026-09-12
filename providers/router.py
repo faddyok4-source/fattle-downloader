@@ -13,7 +13,7 @@ from .terabox import TeraBoxProvider
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
 INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com"}
 TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com"}
-ROUTER_BUILD = "ahm7-prexzy-v3.1"
+ROUTER_BUILD = "ahm7-prexzy-v3.4"
 
 TERABOX_HINTS = (
     "terabox", "1024tera", "nephobox", "4funbox", "mirrobox",
@@ -43,7 +43,13 @@ def detect_platform(url: str) -> str:
 
 
 def _order(value: str, default: str) -> list[str]:
-    return [x.strip().lower() for x in (value or default).split(",") if x.strip()]
+    allowed = {"ahm7", "prexzy"}
+    result = []
+    for item in (value or default).split(","):
+        name = item.strip().lower()
+        if name in allowed and name not in result:
+            result.append(name)
+    return result or ["ahm7", "prexzy"]
 
 
 class ProviderRouter:
@@ -93,17 +99,29 @@ class ProviderRouter:
             "terabox": self.terabox.configured,
         }
 
+    def youtube_provider_names(self) -> list[str]:
+        names = []
+        for name in self.youtube_order:
+            provider = getattr(self, name, None)
+            if provider is not None and bool(getattr(provider, "configured", False)):
+                names.append(name)
+        return names
+
+    def resolve_youtube_provider(self, name: str, source_url: str, quality: str) -> ResolvedMedia:
+        name = str(name or "").strip().lower()
+        if name not in {"ahm7", "prexzy"}:
+            raise ProviderError(f"Unknown YouTube provider: {name or 'empty'}")
+        provider = getattr(self, name)
+        if not provider.configured:
+            raise ProviderError(f"YouTube provider {name} is not configured")
+        return provider.resolve(source_url, quality)
+
     def _resolve_youtube(self, source_url: str, quality: str) -> ResolvedMedia:
         errors = []
 
-        for name in self.youtube_order:
+        for name in self.youtube_provider_names():
             try:
-                if name == "ahm7":
-                    if self.ahm7.configured:
-                        return self.ahm7.resolve(source_url, quality)
-                elif name == "prexzy":
-                    if self.prexzy.configured:
-                        return self.prexzy.resolve(source_url, quality)
+                return self.resolve_youtube_provider(name, source_url, quality)
             except ProviderError as exc:
                 errors.append(f"{name}: {exc}")
 

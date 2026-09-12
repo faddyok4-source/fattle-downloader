@@ -17,7 +17,9 @@ def _safe_filename(value: str | None, audio: bool = False) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", str(value or "").strip()).strip(" .")
     name = (name or "youtube")[:150]
     wanted = ".mp3" if audio else ".mp4"
-    if "." not in name.rsplit("/", 1)[-1]:
+    lower = name.lower()
+    known = (".mp3", ".m4a", ".aac", ".wav") if audio else (".mp4", ".m4v", ".webm", ".mov")
+    if not lower.endswith(known):
         name += wanted
     return name
 
@@ -51,6 +53,21 @@ def _title_from(data):
                 if title:
                     return title
     return None
+
+
+def _probable_download_url(url: str, *, audio: bool) -> bool:
+    parsed = urlparse(url)
+    host = str(parsed.hostname or "").lower()
+    path = str(parsed.path or "").lower()
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"} or host.endswith(".youtube.com"):
+        return False
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg")):
+        return False
+    if audio and path.endswith((".mp4", ".m4v", ".webm")):
+        # Keep it as a weak candidate only when the response explicitly calls
+        # it audio; the scorer below can still select a better audio URL.
+        return True
+    return True
 
 
 class PrexzyYouTube:
@@ -95,9 +112,12 @@ class PrexzyYouTube:
         if status in {"error", "failed", "fail"}:
             raise ProviderError(str(data.get("message") or data.get("error") or "Prexzy could not resolve this YouTube URL"))
 
-        candidates = _walk_urls(data)
+        candidates = [
+            (path, url) for path, url in _walk_urls(data)
+            if _probable_download_url(url, audio=audio)
+        ]
         if not candidates:
-            raise ProviderError("Prexzy response did not contain a downloadable URL")
+            raise ProviderError("Prexzy response did not contain a usable downloadable URL")
 
         # Prefer media-looking URLs over thumbnails/artwork.
         scored = []
